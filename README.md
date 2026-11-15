@@ -45,22 +45,49 @@ Health, armor, ammo and the loot magnet are tracked by the host's game, so they 
 
 You can also start `TrainerGUI.exe` by hand before the game, from `...\EX\Binaries\Win64\ue4ss\Mods\GunsDragonsTrainer\`.
 
-## Install / update
+## Install
 
-UE4SS v4.0.0 and the mod are already installed in `D:\SteamLibrary\steamapps\common\GunsDragonsPlaytest\EX\Binaries\Win64`.
+These steps assume neither UE4SS nor the trainer is installed yet.
 
-To reinstall after changing code:
+You'll need Windows 10 or 11, the Guns and Dragons Playtest installed through Steam, and the game set to Borderless or Windowed mode.
+
+### From the release zip
+
+Download `GunsDragonsTrainer_v<version>.zip` and follow `INSTALL_INSTRUCTIONS.txt` inside it. In short: close the game, then copy everything in the zip's `Win64` folder into the game's `EX\Binaries\Win64` folder.
+
+To find that folder, right-click the game in Steam and choose **Manage > Browse local files**. The `Win64` folder is the one containing `EXGameSteam-Win64-Shipping.exe`.
+
+### From this repository
+
+1. Close the game.
+2. Find the game folder: in Steam, right-click "Guns and Dragons Playtest" > **Manage > Browse local files**. It ends in `steamapps\common\GunsDragonsPlaytest`.
+3. From the repository folder, run:
+   ```
+   powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "<game folder>" -UE4SSZip vendor\UE4SS_v4.0.0.zip
+   ```
+   This does four things:
+   - installs UE4SS v4.0.0 from `vendor\`;
+   - adds this game's `MemberVariableLayout.ini` (without it, UE4SS crashes on launch);
+   - turns on hot reload;
+   - installs the trainer and enables it in `mods.txt`.
+4. Start the game. The trainer window appears after a few seconds and shows "Connected to game". All cheats start off.
+
+To build the shareable zip yourself, run `powershell -ExecutionPolicy Bypass -File dist\build_package.ps1`. It writes `dist\GunsDragonsTrainer_v<version>.zip`.
+
+## Update after changing code
 
 ```
 powershell -ExecutionPolicy Bypass -File gui\build.ps1
-powershell -ExecutionPolicy Bypass -File install.ps1
+powershell -ExecutionPolicy Bypass -File install.ps1 -GameDir "<game folder>"
 ```
 
-While the game is running, an update installed by `install.ps1` reloads the trainer automatically. You can also press **Ctrl+R** in-game to reload all UE4SS mods. The trainer saves the game's original stat values to `runtime_state.txt`, so a reload restores them instead of multiplying them again.
+- **Reloading:** while the game is running, an update installed by `install.ps1` reloads the trainer automatically. You can also press **Ctrl+R** in-game to reload all UE4SS mods.
+- **Stats aren't multiplied twice:** the trainer saves the game's original stat values to `runtime_state.txt`, so a reload restores them instead of multiplying them again.
+- **Settings are kept:** your `settings.ini` is never overwritten.
 
-`install.ps1 -UE4SSZip <zip>` also installs or updates UE4SS. Your `settings.ini` is never overwritten.
+## Uninstall
 
-To uninstall, delete `dwmapi.dll` and the `ue4ss` folder from `EX\Binaries\Win64`.
+Delete `dwmapi.dll` and the `ue4ss` folder from the game's `EX\Binaries\Win64` folder.
 
 ## First run checklist
 
