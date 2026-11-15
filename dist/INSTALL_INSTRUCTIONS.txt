@@ -1,0 +1,163 @@
+GUNS & DRAGONS TRAINER v3.5.2 - INSTALL INSTRUCTIONS
+=====================================================
+
+A trainer for the Guns and Dragons Playtest (Steam), built as a UE4SS mod with an on-screen
+settings window. Made for and tested on the Playtest build 1.0.1.518227 (Unreal Engine 5.7).
+
+
+REQUIREMENTS
+------------
+- Windows 10 or 11.
+- Guns and Dragons Playtest installed through Steam.
+- .NET Framework 4.x (already part of Windows 10/11). The settings window needs it.
+- Run the game in Borderless or Windowed mode so the trainer window can appear on top of it.
+
+
+WHAT'S IN THIS ZIP
+------------------
+  INSTALL_INSTRUCTIONS.txt        this file
+  Win64\                          everything that goes into the game's Win64 folder:
+    dwmapi.dll                    loader for UE4SS (the mod framework)
+    ue4ss\                        UE4SS v4.0.0 (MIT license, see ue4ss\LICENSE), already set up for this game:
+      MemberVariableLayout.ini      REQUIRED fix for this game's engine version (without it the game
+                                    crashes on launch)
+      UE4SS-settings.ini            hot reload switched on (see "Reloading" below)
+      Mods\mods.txt                 the trainer is already enabled in here
+      Mods\GunsDragonsTrainer\      the trainer itself (scripts, icons, TrainerGUI.exe)
+
+
+INSTALL
+-------
+1. Close the game.
+
+2. Find the game folder: in Steam, right-click "Guns and Dragons Playtest" >
+   Manage > Browse local files. A folder like this opens:
+       ...\steamapps\common\GunsDragonsPlaytest
+
+3. Open these folders inside it:
+       EX\Binaries\Win64
+   You should see EXGameSteam-Win64-Shipping.exe in there. This is the target folder.
+
+4. Copy EVERYTHING from the zip's "Win64" folder into that Win64 folder
+   (dwmapi.dll and the ue4ss folder). If Windows asks, choose "Replace the files".
+   When you're done, the folder contains:
+       EXGameSteam-Win64-Shipping.exe
+       dwmapi.dll
+       ue4ss\...
+
+5. Start the game from Steam as usual.
+   - A small "GUNS & DRAGONS TRAINER" window opens next to the game after a few seconds.
+   - Its top line says "Connected to game" once the trainer is running.
+   - All cheats start switched OFF. Turn on what you want in the window. Settings are saved
+     automatically and remembered next time.
+
+If you already use UE4SS with other mods: don't overwrite your ue4ss\Mods\mods.txt. Instead add this
+line to it, above the "Keybinds : 1" line:
+    GunsDragonsTrainer : 1
+and copy only these files from the zip: ue4ss\Mods\GunsDragonsTrainer\ (the whole folder) and
+ue4ss\MemberVariableLayout.ini. MemberVariableLayout.ini is still needed.
+
+
+THE TRAINER WINDOW
+------------------
+- Insert: shows or hides the window. You can change this key in the window.
+- Drag the title bar to move it. The position is remembered.
+- The top line shows whether you are Solo, Hosting, or Joined (client), and what aim assist is
+  locked onto.
+
+
+WHAT WORKS WHERE (ONLINE CO-OP)
+-------------------------------
+The trainer only ever changes YOUR character. Teammates are never affected.
+
+Work when you HOST or play SOLO (the host's game decides these):
+  - Infinite health, infinite ammo, infinite armor
+  - Loot magnet (pulls pickups to you)
+
+Work whether you host or JOIN someone else:
+  - Aim assist and everything in the Aim assist section
+  - Highlights (supplies and pickups, loot chests, secret walls) and minimap icons
+  - Ping key
+
+Fully work when you host. When you join, they work partly or not at all, because the host's game has
+the final say:
+  - No spread, fire rate multiplier (also bow draw speed), reload speed, movement speed,
+    no dash cooldown. Joined players may get pulled back (rubber-banding) with movement speed.
+
+
+FEATURES
+--------
+Cheats (host/solo)
+  Infinite health / ammo / armor, loot magnet (with radius).
+
+Weapon & movement
+  No spread, fire rate multiplier, reload speed multiplier, movement speed multiplier,
+  no dash cooldown.
+
+Aim assist (default: hold Right Mouse)
+  - Locks onto the enemy closest to your crosshair within the radius and distance you set.
+  - Aims at the weak spot, then the head, then the upper body. Works on wall-mounted enemies.
+  - Skips friendly summons (e.g. Thorn Blooms).
+  - Shoots lifeline imps and soul-binding shamans first, because they make other enemies
+    invulnerable.
+  - Prefers explosive gear (barrels, grenades) when it faces you.
+  - Aims over held shields.
+  - Ignores mushrooms while they are ducked (they block damage then).
+  - Leads moving targets and compensates for bullet drop.
+  - "Aim assist targets supplies": also shoots the flying clay supplies, one shot each, then the next
+    clay.
+  Mode, hold key, radius, snap strength and max distance are set in the window.
+
+Supplies & highlights
+  - Highlight supplies and pickups: clay launchers (bone/tomb/barrel piles), flying clays, pickups.
+  - Highlight loot chests: resource chests, artifact boxes, secret room chests.
+  - Highlight secret walls: cracked breakable walls.
+  - Show highlights on minimap (experimental): draws icons for highlighted chests, launchers and
+    secret walls on the minimap, including ones the game itself hides.
+
+Ping key (default F8)
+  Logs whatever is under your crosshair to ue4ss\Mods\GunsDragonsTrainer\pings.txt. It changes nothing
+  in the game. Useful for reporting enemies or objects the trainer should handle.
+
+
+RELOADING WITHOUT RESTARTING THE GAME
+-------------------------------------
+- Ctrl+R in game reloads all UE4SS mods, including the trainer.
+- Replacing the trainer's script files while the game runs reloads it automatically.
+
+
+UNINSTALL
+---------
+Delete dwmapi.dll and the ue4ss folder from ...\EX\Binaries\Win64. To keep UE4SS but remove only the
+trainer, delete ue4ss\Mods\GunsDragonsTrainer and its line in ue4ss\Mods\mods.txt.
+
+
+TROUBLESHOOTING
+---------------
+The game crashes right at launch
+  - Make sure ue4ss\MemberVariableLayout.ini was copied. UE4SS crashes on this game without it.
+  - If the game was updated after this trainer was made, the engine layout may have changed, and the
+    trainer needs updating. To play without it until then, rename dwmapi.dll to dwmapi.dll.disabled.
+
+No trainer window appears
+  - Wait about 10 seconds after the game window opens.
+  - Run the game in Borderless or Windowed mode.
+  - Press Insert in case the window is hidden.
+  - You can also start it by hand: ue4ss\Mods\GunsDragonsTrainer\TrainerGUI.exe
+
+Window says "Game running, mod not responding"
+  Open ue4ss\UE4SS.log and look for lines containing "[G&D Trainer]". The last error is also shown
+  at the bottom of the trainer window.
+
+Antivirus warning about dwmapi.dll
+  dwmapi.dll is UE4SS's loader. It works by loading itself into the game, which some antivirus
+  programs flag. You may need to allow it.
+
+Health/ammo/armor do nothing
+  You joined someone else's game. These only work when you host or play solo (see above).
+
+Files the trainer writes (safe to delete; they are recreated)
+  ue4ss\Mods\GunsDragonsTrainer\settings.ini       your settings
+  ...\status.ini, probe.txt, enemies.txt, pings.txt, runtime_state.txt   status and diagnostics
+  ue4ss\UE4SS.log                                   UE4SS log
+  ue4ss\crash_*.dmp                                 crash dumps, if the game ever crashed

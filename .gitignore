@@ -1,0 +1,14 @@
+# Files the trainer writes at runtime (personal settings, status, diagnostics)
+settings.ini
+status.ini
+probe.txt
+enemies.txt
+pings.txt
+runtime_state.txt
+*.log
+*.dmp
+*.old
+
+# Build output (rebuild with dist/build_package.ps1)
+dist/staging/
+dist/*.zip
