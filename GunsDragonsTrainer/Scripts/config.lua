@@ -42,6 +42,14 @@ return {
         attributes = { { "Shield", "MaxShield" } },
     },
 
+    -- Infinite self revives: the count under your portrait and the "revives used" counter.
+    revives = {
+        countSet = "EXRogueLiteAttributeSet",
+        countAttr = "NumResurrectCount",
+        usedProp = "ResurrectionCount", -- on EXPlayerState
+        minCount = 1,                   -- keep at least this many, even if you had none when switching it on
+    },
+
     -- Stats on your player state's EXRogueLiteAttributeSet.
     stats = {
         set = "EXRogueLiteAttributeSet",
@@ -100,7 +108,12 @@ return {
                            "EXASDynamicEventPoint", "BP_DynamicEvent_Grave_C" },
                eventClass = "EXASDynamicEventPoint",
                -- The reward chest (B_SuddenEventReward_Level_01_C) appears within this distance (cm) of its event.
-               rewardClasses = { "EXASSuddenEventReward", "B_SuddenEventReward_C" }, eventRewardRadius = 800 },
+               rewardClasses = { "EXASSuddenEventReward", "B_SuddenEventReward_C" }, eventRewardRadius = 800,
+               -- Artifact boxes: players who already opened it (EXPlayerState list).
+               usedListProp = "UsedPlayer" },
+
+    -- Objects in a hidden dungeon you're not in (its sublevel stays loaded, objects inactive) are not highlighted.
+    highlightSkip = { dungeonLevelMarker = "HiddenSubLevel_" },
 
     -- Experimental "Show highlights on minimap": the trainer draws its own icons (icons\*.png next to the mod,
     -- made by icons\make_icons.ps1) on the game's minimap for highlighted objects, including ones the game has
@@ -116,6 +129,9 @@ return {
         },
         iconSize = 27,           -- px, same as the game's badges
         poolSize = 24,           -- icon images added to the minimap once; the nearest objects use them
+        dotPoolSize = 40,        -- extra small images for "magnet items on minimap" dots
+        dotIcon = "loot_dot.png",
+        dotSize = 9,             -- px
         namePrefix = "GDT_MinimapIcon_",
         iconWidgetClass = "W_MinimapIcon_C", -- the game's icons, used to measure the map scale
         defaultScale = 0.06,     -- px per cm (measured 2026-11-15); re-measured live from the game's icons
@@ -146,6 +162,12 @@ return {
         binders = {
             { class = "B_C1_Goblin_Shaman_Elite_C", listProp = "SoulBindingMonsters" },
         },
+        -- Casters whose shield makes other enemies invulnerable while it lasts (Troll Summoner's skill:
+        -- GA_NPC_Troll_Summoner_Skill02 puts this effect actor on each shielded enemy).
+        shieldCasters = {
+            { casterClass = "EXASTrollSummoner", effectClass = "B_ReplicatedVFX_Troll_Summoner_Shield_C",
+              attachRadius = 250 },
+        },
     },
 
     -- Weapon spread data asset fields set to 0 while "no spread" is on (restored when turned off).
@@ -163,12 +185,39 @@ return {
         ignoreClasses = { "EXASThornBloom" },
         -- Line of fire (with "line of sight" on): the aim point must be reachable from the camera and the gun
         -- without hitting terrain, walls or a shield; otherwise another point on the enemy is used.
+        -- Enemy parts that take no damage (physics material tagged Gameplay.Zone.God: PhysMat_Player_Wood,
+        -- _Stone, _Metal, _MagicShield), read from the physics assets 2026-11-15. Shapes are in the bone's space
+        -- (cm); rot = Pitch, Yaw, Roll; box size = full X, Y, Z; capsule length = between its sphere centers.
+        -- Abilities that make their enemy immune while a flag is set: the enemy is skipped meanwhile.
+        immuneFlags = {
+            { class = "GA_NPC_Troll_Hunter_Elite_BushAmbush_C", flag = "bAmbushDamageImmune" }, -- hiding in a bush
+        },
+        godZones = {
+            B_C2_Troll_Tamer_C = {
+                { bone = "Mask", shapes = {
+                    { kind = "box", center = { 42.3, 0, 0 }, rot = { -0.6, 3.8, 8.4 }, size = { 97, 42.1, 20.1 } } } },
+            },
+            B_C2_Troll_Summoner_C = {
+                { bone = "Bone021", shapes = {
+                    { kind = "sphere", center = { 0, 2.2, -20.1 }, radius = 16.7 },
+                    { kind = "sphere", center = { 0, 0, 19.8 }, radius = 15.8 },
+                    { kind = "capsule", center = { 18.6, 3.1, 0.1 }, rot = { 0, -90.5, -90 }, radius = 25.1, length = 62.6 } } },
+            },
+        },
         lineOfFire = {
             traceChannel = 0,       -- TraceTypeQuery1 = Visibility
             pointTolerance = 25,    -- cm; a hit this close to the aim point counts as reaching it
             maxBones = 24,          -- bones tried at most per enemy type
             skipBones = { "ik_", "root", "attach", "weapon", "socket", "prop", "camera", "_end", "twist", "pole" },
             stickySeconds = 0.3,    -- prefer the last clear point for this long (no flicker)
+            bodyRadiusScale = 0.8,  -- other enemies' capsules count as this wide when checking who's in the way
+            godMargin = 4,          -- cm of clearance kept around damage-proof parts
+            -- Fallback order when the planned point is blocked: weak spot (+ points this far around it),
+            -- head (+ points around it, bones named like a head), then the rest of the body.
+            weakSpotEdge = 10,      -- cm
+            headEdge = 14,          -- cm
+            headBones = { "head", "neck", "face", "jaw", "eye", "brow", "skull" },
+            inFrontFraction = 0.95, -- a body must be before this fraction of the line to count as in the way
         },
         -- Keep a locked target this long after it goes out of sight (e.g. behind its own shield).
         stickySeconds = 1.5,
@@ -219,8 +268,13 @@ return {
     },
 
     loot = {
-        -- Pickups pulled to you by the loot magnet when you host or play solo.
+        -- Pickups pulled in by the loot magnet. Host / solo: moved onto you. Joined: picked up through the
+        -- game's own pickup request on your character's item detection component.
         classes = { "EXAutoCollectObject" },
+        detectionComponent = "ItemDetectionComponent",
+        clientTries = 6,          -- requests per pickup at most (full inventory, someone else's item, ...)
+        clientRetrySeconds = 0.5, -- between requests for the same pickup
+        clientPerTick = 8,        -- requests per 0.1 s at most
         -- Per-player drops: never pulled.
         skipClasses = { EXExclusiveAutoCollectObject = true },
     },

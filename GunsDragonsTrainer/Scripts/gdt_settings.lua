@@ -9,6 +9,7 @@ M.schema = {
     { key = "infiniteHealth", type = "bool",   default = false },
     { key = "infiniteAmmo",   type = "bool",   default = false },
     { key = "infiniteArmor",  type = "bool",   default = false },
+    { key = "infiniteRevives", type = "bool",  default = false },
     { key = "aimAssist",      type = "bool",   default = false },
     { key = "aimFov",         type = "number", default = 10,  min = 1, max = 90 },   -- degrees around crosshair
     { key = "aimMode",        type = "enum",   default = "hold", values = { hold = true, always = true } },
@@ -22,6 +23,7 @@ M.schema = {
     { key = "highlightSupplies", type = "bool", default = false },
     { key = "lootMagnet",     type = "bool",   default = false },
     { key = "lootMagnetRadius", type = "number", default = 30, min = 5, max = 100 }, -- meters
+    { key = "minimapLootDots", type = "bool",  default = false },  -- dots on the minimap for pickups in magnet range
     { key = "noDashCooldown", type = "bool",   default = false },
     { key = "noSpread",       type = "bool",   default = false },
     { key = "fireRate",       type = "bool",   default = false },

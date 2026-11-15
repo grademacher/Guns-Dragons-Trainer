@@ -7,7 +7,9 @@ A [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) Lua mod with a companion window 
 | Infinite health | host or play solo | Refills `Health` to `MaxHealth` every frame and sets your `FinalReceivedDamageRatio` stat to -1 (no damage taken). |
 | Infinite ammo | host or play solo | Refills your weapons' magazines and sets `UseAmmoOnFire` to 0. |
 | Infinite armor | host or play solo | Tops `Shield` up to `MaxShield`. |
-| Loot magnet | host or play solo | Pulls pickups within the radius to you and widens your pickup range. Per-player drops are left alone. |
+| Infinite self revives | host or play solo | Keeps the revive count under your portrait (`NumResurrectCount` on your `EXRogueLiteAttributeSet`) from dropping, through the game's own attribute setter so the HUD number stays right, and holds `EXPlayerState.ResurrectionCount` (revives used). Keeps at least one. |
+| Loot magnet | host, solo **or** join | Host / solo: pulls pickups within the radius onto you. Joined: sends the game's own pickup request (`ItemDetectionComponent.ServerItemPickup`) for each pickup in range; the host doesn't check the distance. Widens your pickup range too. Per-player drops are left alone. |
+| Magnet items on minimap | host **or** join | Small gold dots on the minimap for every pickup inside the magnet radius (up to 40, nearest first). |
 | No spread | host; best effort when joined | Zeroes your spread stats and your weapon's spread multipliers. They are restored when you turn it off. |
 | Fire rate multiplier | host; best effort when joined | Multiplies your `FireRateRatio` stat and bow draw speed (`ChargeSpeedRate`, `ChargeDoneTime`). Buffs still stack on top. |
 | No dash cooldown | host; best effort when joined | Cooldown ~0 and dash charges kept full. |
@@ -17,7 +19,7 @@ A [UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) Lua mod with a companion window 
 | Aim over shields | host **or** join | If the line to the weak spot or head crosses a carried or forward shield, it aims at the next point that's clear, or raises the aim until it clears the shield's top edge. |
 | Highlight loot chests | host **or** join | Outlines unopened resource chests, artifact boxes and secret room reward chests. |
 | Highlight secret walls | host **or** join | Outlines cracked secret walls (`B_SecretBreakableWall_C`). |
-| Protectors first | host **or** join | When an enemy is protected by a tethered lifeline imp or bound by a Goblin Shaman Elite's Soul Binding, the aim goes to the protector until it dies. |
+| Protectors first | host **or** join | When an enemy is protected by a tethered lifeline imp, bound by a Goblin Shaman Elite's Soul Binding, or shielded by a Troll Summoner (`B_ReplicatedVFX_Troll_Summoner_Shield_C` on it), the aim goes to the protector until it dies or the protection ends. |
 | Ducking mushrooms: shoot their hat | host **or** join | While a spore colony mushroom is ducked, its body blocks damage but the glowing hat orbs on top (`ElphaHat*` bones) do not: aim goes to the topmost orb it can reach. Breaking the hat stuns the mushroom. Once the hat is broken, a ducked mushroom is skipped until it pops up. |
 | Lead moving targets | host **or** join | Leads moving targets (flying clays) and compensates for bullet drop, using your weapon's bullet speed and gravity. |
 | Aim assist | host **or** join | While the hold key is down, it locks onto the hostile enemy closest to your crosshair. It aims at the game's weak spot, then the game's own auto-aim point, then the head, then the top of the body along the enemy's own up axis (wall-mounted enemies). Friendly summons such as Thorn Blooms are skipped. A locked target stays locked for 1.5 s if it hides behind a shield. |

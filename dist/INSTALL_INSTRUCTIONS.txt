@@ -64,10 +64,11 @@ WHAT WORKS WHERE (ONLINE CO-OP)
 The trainer only ever changes YOUR character. Teammates are never affected.
 
 Work when you HOST or play SOLO (the host's game decides these):
-  - Infinite health, infinite ammo, infinite armor
-  - Loot magnet (pulls pickups to you)
+  - Infinite health, infinite ammo, infinite armor, infinite self revives
 
 Work whether you host or JOIN someone else:
+  - Loot magnet (host/solo: pulls pickups to you; joined: asks the host to give you each pickup in range)
+  - Magnet items on the minimap (small gold dots)
   - Aim assist and everything in the Aim assist section
   - Highlights (supplies and pickups, loot chests, secret walls) and minimap icons
   - Ping key
@@ -80,8 +81,10 @@ the final say:
 
 FEATURES
 --------
-Cheats (host/solo)
-  Infinite health / ammo / armor, loot magnet (with radius).
+Cheats
+  Infinite health / ammo / armor / self revives (host or solo).
+  Loot magnet with radius (also when joined), and "Show magnet items on minimap": a small gold dot for
+  each pickup the magnet would grab.
 
 Weapon & movement
   No spread, fire rate multiplier, reload speed multiplier, movement speed multiplier,
@@ -91,7 +94,7 @@ Aim assist (default: hold Right Mouse)
   - Locks onto the enemy closest to your crosshair within the radius and distance you set.
   - Aims at the weak spot, then the head, then the upper body. Works on wall-mounted enemies.
   - Skips friendly summons (e.g. Thorn Blooms).
-  - Shoots lifeline imps and soul-binding shamans first, because they make other enemies
+  - Shoots lifeline imps, soul-binding shamans and shielding Troll Summoners first, because they make other enemies
     invulnerable.
   - Prefers explosive gear (barrels, grenades) when it faces you.
   - Aims over held shields.

@@ -262,7 +262,7 @@ namespace GunsDragonsTrainer
         const int ColW = 330;
 
         ToggleRow tHealth, tAmmo, tArmor, tAim, tLos, tWeak, tTop;
-        ToggleRow tMagnet, tSpread, tFire, tDash, tSupAim, tHighlight, tReload, tMove, tExplosive, tOverShield, tChests, tLead, tGuards, tWalls, tBurrow, tMinimap;
+        ToggleRow tRevives, tLootDots, tMagnet, tSpread, tFire, tDash, tSupAim, tHighlight, tReload, tMove, tExplosive, tOverShield, tChests, tLead, tGuards, tWalls, tBurrow, tMinimap;
         SliderRow sFov, sSmooth, sDist, sOpacity, sMagnet, sFire, sReload, sMove;
         ComboBox cMode, cHoldKey, cToggleKey, cMarkKey;
         Label lConn, lRole, lTarget, lHint, lSupplies;
@@ -398,10 +398,12 @@ namespace GunsDragonsTrainer
             tHealth = Toggle("Infinite health");
             tAmmo = Toggle("Infinite ammo");
             tArmor = Toggle("Infinite armor");
-            tMagnet = Toggle("Loot magnet");
+            tRevives = Toggle("Infinite self revives");
+            tMagnet = Toggle("Loot magnet (also works when joined)");
             sMagnet = new SliderRow("Magnet radius", 5, 100, v => v + " m");
             sMagnet.Changed += delegate { ScheduleSave(); };
-            Section("Cheats (host / solo)", new Control[] { tHealth, tAmmo, tArmor, tMagnet, sMagnet }, ref y, left);
+            tLootDots = Toggle("Show magnet items on minimap");
+            Section("Cheats (host / solo)", new Control[] { tHealth, tAmmo, tArmor, tRevives, tMagnet, sMagnet, tLootDots }, ref y, left);
 
             tSpread = Toggle("No spread");
             tFire = Toggle("Fire rate multiplier");
@@ -443,7 +445,7 @@ namespace GunsDragonsTrainer
             tExplosive = Toggle("Prefer explosive gear in clear view");
             tOverShield = Toggle("Aim over shields");
             tLead = Toggle("Lead moving targets / bullet drop");
-            tGuards = Toggle("Shoot protectors first (imps, shamans)");
+            tGuards = Toggle("Shoot protectors first (imps, shamans, summoners)");
             tBurrow = Toggle("Ducking mushrooms: shoot their hat");
             lTarget = new Label { ForeColor = Theme.Muted, AutoSize = false, Height = 18, Text = "" };
             Section("Aim assist (works as host or client)", new Control[] {
@@ -507,6 +509,8 @@ namespace GunsDragonsTrainer
             sMove.Value = (int)Math.Round(settings.GetDouble("moveSpeedMultiplier", 1.5, 1, 3) * 10);
             tChests.Checked = settings.GetBool("highlightChests", false);
             tMagnet.Checked = settings.GetBool("lootMagnet", false);
+            tRevives.Checked = settings.GetBool("infiniteRevives", false);
+            tLootDots.Checked = settings.GetBool("minimapLootDots", false);
             sMagnet.Value = settings.GetInt("lootMagnetRadius", 30, 5, 100);
             tSpread.Checked = settings.GetBool("noSpread", false);
             tFire.Checked = settings.GetBool("fireRate", false);
@@ -569,6 +573,8 @@ namespace GunsDragonsTrainer
             settings.Set("moveSpeedMultiplier", Fmt(sMove.Value / 10.0));
             settings.Set("highlightChests", b(tChests.Checked));
             settings.Set("lootMagnet", b(tMagnet.Checked));
+            settings.Set("infiniteRevives", b(tRevives.Checked));
+            settings.Set("minimapLootDots", b(tLootDots.Checked));
             settings.Set("lootMagnetRadius", sMagnet.Value.ToString());
             settings.Set("noSpread", b(tSpread.Checked));
             settings.Set("fireRate", b(tFire.Checked));

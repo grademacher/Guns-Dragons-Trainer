@@ -11,11 +11,14 @@
 -- UE 5.7 note: never pass gameplay tag containers (or other structs holding arrays) to game functions
 -- from here. UE4SS v4.0.0 crashes the game doing that (that was the "infinite health" crash).
 
+-- Helpers used in one place live on this table instead of being top-level locals: Lua allows 200 locals
+-- per chunk and UE4SS adds a few of its own when it loads the script (v3.9.0 failed to load at ~200).
+local F = {}
 local cfg = require("config")
 local Settings = require("gdt_settings")
 local Aim = require("gdt_aim")
 
-local VERSION = "3.7.0"
+local VERSION = "3.10.2"
 local TAG = "[G&D Trainer] "
 
 local function log(fmt, ...)
@@ -264,7 +267,7 @@ end
 
 -- Addresses of this PC's controller, pawn and player state. Used to decide whether an attribute set or
 -- weapon belongs to us (its outer chain leads to one of these).
-local function localOwners(pc)
+function F.localOwners(pc)
     local owners = {}
     if not pc then return owners end
     local a = addr(pc); if a then owners[a] = true end
@@ -343,19 +346,68 @@ local function writeCurrent(set, name, value)
     end)
 end
 
-local function topUp(sets, pairsList)
-    for _, set in ipairs(sets) do
-        for _, pr in ipairs(pairsList) do
-            local cur, max = readAttr(set, pr[1]), readAttr(set, pr[2])
-            if cur and max and max > 0 and cur < max then
-                writeAttr(set, pr[1], max)
+local function same(a, b)
+    return math.abs(a - b) <= 1e-4 * math.max(1, math.abs(b))
+end
+
+local hudSynced = {} -- "set address|attribute" -> true once the game's setter was used (reset when a cheat turns off)
+
+-- Writing an attribute straight into memory works for the game's logic, but the HUD only redraws when the
+-- ability system announces a change. For sets named here, the game's own setter
+-- (EXAbilitySystemComponent.SetAttributeBaseValueByName) is used instead, which announces it.
+local announcedSet -- function(set, setName, attrName, value) -> true when the game's setter took it
+do
+    local ascOf = {}      -- attribute set address -> its ability system component
+    local loggedSetter = false
+    local function asc(set)
+        local a = addr(set)
+        local c = ascOf[a]
+        if valid(c) then return c end
+        local owner = try(function() return set:GetOuter() end)
+        local oa = owner and addr(owner)
+        for _, cand in ipairs(FindAllOf("EXAbilitySystemComponent") or {}) do
+            if valid(cand) and oa and addr(try(function() return cand:GetOwner() end)) == oa then
+                ascOf[a] = cand
+                return cand
             end
         end
+        return nil
+    end
+    function announcedSet(set, setName, attrName, value, cur)
+        local c = asc(set)
+        if not c then return false end
+        local ok, err = pcall(function()
+            if cur and same(cur, value) then
+                -- Already full in memory (written directly earlier), but the HUD never heard: change it
+                -- slightly first so the game announces the full value.
+                c:SetAttributeBaseValueByName(setName, fname(attrName), value * 0.999)
+            end
+            c:SetAttributeBaseValueByName(setName, fname(attrName), value)
+        end)
+        if not loggedSetter then
+            loggedSetter = true
+            log("game attribute setter (HUD updates): %s", ok and "works" or ("failed: " .. tostring(err)))
+        end
+        return ok
     end
 end
 
-local function same(a, b)
-    return math.abs(a - b) <= 1e-4 * math.max(1, math.abs(b))
+-- Fills each cur attribute up to its max. With setName, through the game's setter (HUD updates).
+local function topUp(sets, pairsList, setName)
+    for _, set in ipairs(sets) do
+        for _, pr in ipairs(pairsList) do
+            local cur, max = readAttr(set, pr[1]), readAttr(set, pr[2])
+            if cur and max and max > 0 then
+                local key = setName and (tostring(addr(set)) .. "|" .. pr[1])
+                if setName and (cur < max or not hudSynced[key]) then
+                    hudSynced[key] = true
+                    if not announcedSet(set, setName, pr[1], max, cur) and cur < max then writeAttr(set, pr[1], max) end
+                elseif cur < max then
+                    writeAttr(set, pr[1], max)
+                end
+            end
+        end
+    end
 end
 
 -- Stat overrides that remember the game's own value, so turning a cheat off puts it back.
@@ -375,7 +427,7 @@ local function sessionId()
     return tostring(e and addr(e) or "none")
 end
 
-local function loadState()
+function F.loadState()
     local text = readFile(STATE_PATH)
     if not text then return end
     local session = text:match("^session=([^\r\n]*)")
@@ -464,10 +516,10 @@ local undamageablePawn = nil
 
 local function healthFrame()
     if not (S.infiniteHealth and hasAuthority()) then return end
-    topUp(cachedOwned("EXHealthSet"), cfg.health.attributes)
+    topUp(cachedOwned("EXHealthSet"), cfg.health.attributes, "EXHealthSet")
 end
 
-local function healthTick(pc)
+function F.healthTick(pc)
     local pawn = localPawn(pc)
     if pawn and addr(pawn) ~= undamageablePawn then
         try(function() pawn.bCanBeDamaged = false end)
@@ -482,7 +534,7 @@ local function healthTick(pc)
     healthFrame()
 end
 
-local function healthOff(pc)
+function F.healthOff(pc)
     release("health")
     if undamageablePawn then
         local pawn = localPawn(pc)
@@ -495,7 +547,7 @@ end
 -- Infinite ammo / armor (host / solo)
 ---------------------------------------------------------------------------
 
-local function ammoTick()
+function F.ammoTick()
     for _, w in ipairs(cachedOwned("EXRangedWeaponInstance")) do
         local size = try(function() return w:GetMagazineSize() end)
         local cur = try(function() return w:GetCurrentMagazineAmmo() end)
@@ -524,8 +576,51 @@ local function ammoTick()
     end
 end
 
-local function armorTick()
-    topUp(cachedOwned(cfg.armor.set), cfg.armor.attributes)
+function F.armorTick()
+    topUp(cachedOwned(cfg.armor.set), cfg.armor.attributes, cfg.armor.set)
+end
+
+---------------------------------------------------------------------------
+-- Infinite self revives (host / solo)
+-- The number under your portrait is NumResurrectCount on your EXRogueLiteAttributeSet (base 0 plus bonuses);
+-- EXPlayerState.ResurrectionCount counts revives used. While on, the count never drops below what it was
+-- when the cheat was switched on (at least cfg.revives.minCount) and the used counter never goes up.
+---------------------------------------------------------------------------
+
+local reviveTick, reviveOff
+do
+    local held = {} -- set address -> count to keep; "ps" -> used counter to keep
+    function reviveTick(pc)
+        local R = cfg.revives
+        for _, set in ipairs(statSets()) do
+            local cur = readAttr(set, R.countAttr)
+            local a = addr(set)
+            if cur and a then
+                local keep = held[a]
+                if keep == nil or cur > keep then keep = math.max(cur, R.minCount) end -- new bonuses raise it
+                held[a] = keep
+                if cur < keep then
+                    local base = try(function() return set[R.countAttr].BaseValue end) or 0
+                    local want = base + (keep - cur)
+                    if not announcedSet(set, R.countSet, R.countAttr, want, nil) then
+                        try(function()
+                            set[R.countAttr].BaseValue = want
+                            set[R.countAttr].CurrentValue = keep
+                        end)
+                    end
+                end
+            end
+        end
+        local ps = try(function() return pc.PlayerState end)
+        local used = valid(ps) and try(function() return ps[R.usedProp] end)
+        if type(used) == "number" then
+            if held.ps == nil or used < held.ps then held.ps = used end
+            if used > held.ps then try(function() ps[R.usedProp] = held.ps end) end
+        end
+    end
+    function reviveOff()
+        held = {}
+    end
 end
 
 ---------------------------------------------------------------------------
@@ -572,7 +667,7 @@ local function spreadOff()
     end
 end
 
-local function dashTick()
+function F.dashTick()
     local st = cfg.stats
     for _, set in ipairs(statSets()) do
         override("dash", set, st.dashCooldown, function(n) return math.min(n, st.dashCooldownValue) end)
@@ -580,7 +675,7 @@ local function dashTick()
     topUp(statSets(), { st.dashCharges })
 end
 
-local function fireRateTick()
+function F.fireRateTick()
     local mult = S.fireRateMultiplier
     for _, set in ipairs(statSets()) do
         override("fireRate", set, cfg.stats.fireRate, function(n) return n * mult end)
@@ -597,14 +692,14 @@ local function reloadTick()
     end
 end
 
-local function moveTick(pawn)
+function F.moveTick(pawn)
     local mc = try(function() return pawn.CharacterMovement end)
     if not valid(mc) then return end
     local mult = S.moveSpeedMultiplier
     overrideValue("prop", "move", mc, "MaxWalkSpeed", function(n) return n * mult end)
 end
 
-local function lootRangeTick()
+function F.lootRangeTick()
     local range = S.lootMagnetRadius * 100
     for _, set in ipairs(statSets()) do
         override("loot", set, cfg.stats.lootRange, function(n) return math.max(n, range) end)
@@ -708,7 +803,7 @@ local mm = {
 }
 local CENTER = 2 -- EHorizontalAlignment / EVerticalAlignment "Center" (plain byte parameters)
 
-local function minimapIconFor(actor)
+function F.minimapIconFor(actor)
     for _, e in ipairs(MM.icons) do
         if chainHas(actor, { [e.parent] = true }) then return e.icon end
     end
@@ -718,7 +813,7 @@ end
 -- The minimap on screen. A leftover minimap from the previous map stays alive (v3.5.1 drew on the camp's), so
 -- use the one your own player icon belongs to: every game icon widget records its minimap (MinimapRef).
 -- Re-checked about once a second.
-local function minimapWidget(pc)
+function F.minimapWidget(pc)
     if mm.pick and valid(mm.pick) and now() - (mm.pickedAt or -100) < 1 then return mm.pick end
     mm.pickedAt = now()
     local pawnA = pc and addr(localPawn(pc))
@@ -742,7 +837,7 @@ local function minimapWidget(pc)
     return mm.pick
 end
 
-local function iconTexture(name, pc)
+function F.iconTexture(name, pc)
     local t = mm.textures[name]
     if valid(t) then return t end
     local lib = cdo("/Script/Engine.Default__KismetRenderingLibrary")
@@ -752,7 +847,7 @@ local function iconTexture(name, pc)
     return nil
 end
 
-local function dropPool()
+function F.dropPool()
     for _, p in ipairs(mm.pool) do
         if valid(p.img) then pcall(function() p.img:RemoveFromParent() end) end
     end
@@ -771,14 +866,14 @@ local function removeStrayIcons()
     end
 end
 
-local function ensurePool(pc)
-    local w = minimapWidget(pc)
+function F.ensurePool(pc)
+    local w = F.minimapWidget(pc)
     if not w then return false end
     -- Compare addresses: UE4SS hands out a new Lua handle on every lookup, so handles never compare equal
     -- (comparing handles rebuilt the whole pool every frame in v3.5.0).
     local wa = addr(w)
     if wa == mm.widgetAddr and #mm.pool > 0 and valid(mm.overlay) then return true end
-    dropPool()
+    F.dropPool()
     mm.widget, mm.widgetAddr, mm.overlay = w, wa, try(function() return w.MinimapOverlay end)
     if not valid(mm.overlay) then return false end
     removeStrayIcons()
@@ -786,7 +881,12 @@ local function ensurePool(pc)
     local tree = try(function() return mm.overlay:GetOuter() end)
     if not valid(imageClass) or not valid(tree) then return false end
     local size = { X = MM.iconSize, Y = MM.iconSize }
-    for i = 1, MM.poolSize do
+    -- Dot slots are added to the overlay first so badges draw on top of them; the pool lists badge slots
+    -- first (1..poolSize), then dot slots.
+    local badges, dotSlots = {}, {}
+    local total = MM.poolSize + MM.dotPoolSize
+    for n = 1, total do
+        local i = n <= MM.dotPoolSize and (MM.poolSize + n) or (n - MM.dotPoolSize)
         local name = FName(string.format("%s%s_%d", MM.namePrefix, mm.session, i))
         local img = StaticConstructObject(imageClass, tree, name)
         if not valid(img) then break end
@@ -795,16 +895,20 @@ local function ensurePool(pc)
             slot:SetHorizontalAlignment(CENTER)
             slot:SetVerticalAlignment(CENTER)
         end
+        pcall(function() img:SetBrushSize(size) end)
         img:SetDesiredSizeOverride(size)
         img:SetRenderOpacity(0)
-        mm.pool[#mm.pool + 1] = { img = img, shown = false }
+        local list = i > MM.poolSize and dotSlots or badges
+        list[#list + 1] = { img = img, shown = false }
     end
+    for _, p in ipairs(badges) do mm.pool[#mm.pool + 1] = p end
+    for _, p in ipairs(dotSlots) do mm.pool[#mm.pool + 1] = p end
     log("minimap: %d icon slots ready", #mm.pool)
     return #mm.pool > 0
 end
 
 -- Measures the minimap's scale (px per cm) and edge radius from the game's own icons.
-local function calibrateMinimap(pawnLoc)
+function F.calibrateMinimap(pawnLoc)
     local ratios = {}
     for _, iw in ipairs(FindAllOf(MM.iconWidgetClass) or {}) do
         if valid(iw) then
@@ -838,20 +942,22 @@ local function calibrateMinimap(pawnLoc)
     end
 end
 
-local function minimapFrame(pc)
-    if not S.minimapIcons or #mm.drawList == 0 then
+-- dots: pickups in loot magnet range ({ loc = vector }), drawn as small dots in their own slots.
+function F.minimapFrame(pc, dots)
+    dots = dots or {}
+    if not ((S.minimapIcons and #mm.drawList > 0) or #dots > 0) then
         for _, p in ipairs(mm.pool) do
             if p.shown and valid(p.img) then pcall(function() p.img:SetRenderOpacity(0) end); p.shown = false end
         end
         return
     end
-    if not ensurePool(pc) then return end
+    if not F.ensurePool(pc) then return end
     local pawn = localPawn(pc)
     local here = pawn and try(function() return pawn:K2_GetActorLocation() end)
     if not isVec(here) then return end
     if now() - mm.calibratedAt > MM.calibrateSeconds then
         mm.calibratedAt = now()
-        pcall(calibrateMinimap, here)
+        pcall(F.calibrateMinimap, here)
     end
     -- The map turns with the camera: rotation -(yaw + 90). A fixed map uses -90.
     local rotating = try(function() return mm.widget.bIsMinimapRotating end) ~= false
@@ -864,7 +970,7 @@ local function minimapFrame(pc)
     local c, s = math.cos(th), math.sin(th)
     -- Nearest objects first.
     local all = {}
-    for _, e in ipairs(mm.drawList) do
+    for _, e in ipairs(S.minimapIcons and mm.drawList or {}) do
         local l = valid(e.actor) and try(function() return e.actor:K2_GetActorLocation() end)
         -- Levels place a secret wall and chest for every possible secret room and park the unused ones at the
         -- world origin; objects far above or below you are in another area (hidden dungeon sublevels).
@@ -884,17 +990,34 @@ local function minimapFrame(pc)
         end
         if not dup then items[#items + 1] = it end
     end
+    -- Loot dots: nearest first, only inside the map (not pinned to the edge).
+    local dotItems = {}
+    for _, d in ipairs(dots) do
+        local dx, dy = d.loc.X - here.X, d.loc.Y - here.Y
+        local x = mm.scale * (dx * c - dy * s)
+        local y = mm.scale * (dx * s + dy * c)
+        if x * x + y * y <= mm.edge * mm.edge then
+            dotItems[#dotItems + 1] = { dx = dx, dy = dy, d2 = dx * dx + dy * dy, icon = MM.dotIcon, dot = true }
+        end
+    end
+    table.sort(dotItems, function(a, b) return a.d2 < b.d2 end)
+    mm.dotsShown = math.min(#dotItems, MM.dotPoolSize)
+    -- Badges go in the first poolSize slots, dots in the rest (drawn under the badges).
     for i, p in ipairs(mm.pool) do
-        local it = items[i]
+        local it
+        if i <= MM.poolSize then it = items[i] else it = dotItems[i - MM.poolSize] end
         if it and valid(p.img) then
             local x = mm.scale * (it.dx * c - it.dy * s)
             local y = mm.scale * (it.dx * s + it.dy * c)
             local r = math.sqrt(x * x + y * y)
             if r > mm.edge then x, y = x / r * mm.edge, y / r * mm.edge end -- pinned to the edge like the game's
             if p.tex ~= it.icon then
-                local tex = iconTexture(it.icon, pc)
+                local tex = F.iconTexture(it.icon, pc)
                 if tex then pcall(function() p.img:SetBrushFromTexture(tex, false) end); p.tex = it.icon end
-                pcall(function() p.img:SetDesiredSizeOverride({ X = MM.iconSize, Y = MM.iconSize }) end)
+                local sz = it.dot and MM.dotSize or MM.iconSize
+                -- Both: the size override alone left dots at the PNG's own 32 px (bigger than a badge).
+                pcall(function() p.img:SetBrushSize({ X = sz, Y = sz }) end)
+                pcall(function() p.img:SetDesiredSizeOverride({ X = sz, Y = sz }) end)
             end
             if not p.x or math.abs(p.x - x) > 0.25 or math.abs(p.y - y) > 0.25 then
                 pcall(function() p.img:SetRenderTranslation({ X = x, Y = y }) end)
@@ -913,7 +1036,7 @@ local function syncIcons()
     if S.minimapIcons then
         for _, o in pairs(highlighted) do
             if valid(o) then
-                local icon = minimapIconFor(o)
+                local icon = F.minimapIconFor(o)
                 if icon then list[#list + 1] = { actor = o, icon = icon } end
             end
         end
@@ -923,12 +1046,30 @@ end
 
 local finishedEvents = {} -- dynamic event address -> true once won (stays hidden after its chest is gone)
 
-local function highlightTick()
+function F.highlightTick()
     local want = {}
+    -- Hidden dungeons are sublevels that stay loaded; the ones you're not in are inactive (bActivated false).
+    -- Their objects would show up as duplicate badges on the minimap border (2026-11-15: an artifact box in
+    -- another dungeon 982 m away).
+    local function inactiveDungeon(o)
+        local a = addr(o)
+        -- Cache (object address -> in a dungeon sublevel) kept on finishedEvents: no new top-level local
+        -- (main.lua is at Lua's 200-locals limit).
+        finishedEvents.dungeonLevelOf = finishedEvents.dungeonLevelOf or {}
+        local dungeonLevelOf = finishedEvents.dungeonLevelOf
+        local inDungeon = dungeonLevelOf[a]
+        if inDungeon == nil then
+            local full = try(function() return o:GetFullName() end) or ""
+            inDungeon = full:find(cfg.highlightSkip.dungeonLevelMarker, 1, true) ~= nil
+            dungeonLevelOf[a] = inDungeon
+        end
+        return inDungeon and try(function() return o.bActivated end) == false
+    end
     local function addAll(classes, skip)
         for _, cls in ipairs(classes or {}) do
             for _, o in ipairs(FindAllOf(cls) or {}) do
-                if valid(o) and try(function() return o.bHidden end) ~= true and not (skip and skip(o)) then
+                if valid(o) and try(function() return o.bHidden end) ~= true and not (skip and skip(o))
+                    and not inactiveDungeon(o) then
                     want[#want + 1] = o
                 end
             end
@@ -971,9 +1112,26 @@ local function highlightTick()
             if done and a then finishedEvents[a] = true end
             return done
         end
+        -- Artifact boxes have no "opened" flag: they list the players who used them (UsedPlayer); in co-op each
+        -- player can open a box once, so it's done when your own player state is on that list.
+        local pc = localPC()
+        local myPs = pc and addr(try(function() return pc.PlayerState end))
+        local function usedByMe(o)
+            if not myPs then return false end
+            local used = false
+            pcall(function()
+                local list = o[cfg.chests.usedListProp]
+                if type(list) == "table" and list.ForEach == nil then
+                    for _, p in ipairs(list) do if addr(p) == myPs then used = true end end
+                else
+                    list:ForEach(function(_, elem) if addr(elem:get()) == myPs then used = true end end)
+                end
+            end)
+            return used
+        end
         addAll(cfg.chests.classes, function(o)
             return try(function() return o.bOpened end) == true or try(function() return o.bDisappearing end) == true
-                or eventDone(o)
+                or eventDone(o) or usedByMe(o)
         end)
     end
     local keep = {}
@@ -996,7 +1154,7 @@ local function highlightTick()
     syncIcons()
 end
 
-local function highlightOff()
+function F.highlightOff()
     for a, o in pairs(highlighted) do
         if valid(o) then setOutline(o, false) end
         highlighted[a] = nil
@@ -1020,25 +1178,50 @@ end
 
 local ZERO_ROT = { Pitch = 0, Yaw = 0, Roll = 0 }
 
-local function lootMagnetTick(pawn)
-    local here = try(function() return pawn:K2_GetActorLocation() end)
-    if not isVec(here) then return end
-    here = vec(here)
+-- Pickups the magnet would take right now: visible, obtainable, within the radius.
+local function magnetItems(here)
+    local out = {}
     local radius = S.lootMagnetRadius * 100
     for _, item in ipairs(lootItems) do
         if valid(item) and try(function() return item.bHidden end) ~= true
             and try(function() return item.bObtainable end) ~= false then
-            local a = addr(item)
             local loc = try(function() return item:K2_GetActorLocation() end)
-            if a and isVec(loc) and near(loc, here, radius) and not near(loc, here, 60) then
-                lootTries[a] = (lootTries[a] or 0) + 1
-                -- Something we can't pick up (full, another player's) stops being pulled after a while.
-                if lootTries[a] <= 30 then
-                    try(function() item:K2_TeleportTo(here, ZERO_ROT) end)
-                end
+            if isVec(loc) and near(loc, here, radius) then out[#out + 1] = { item = item, loc = vec(loc) } end
+        end
+    end
+    return out
+end
+
+-- Host / solo: pickups are moved onto you. Joined: the game's own pickup request
+-- (ItemDetectionComponent.ServerItemPickup) is sent for each one; the host does not check the distance
+-- (tested 2026-11-15: a mana potion 33 m away was collected).
+function F.lootMagnetTick(pawn, authority)
+    local here = try(function() return pawn:K2_GetActorLocation() end)
+    if not isVec(here) then return end
+    here = vec(here)
+    local comp = not authority and try(function() return pawn[cfg.loot.detectionComponent] end)
+    if not authority and not valid(comp) then return end
+    local sent, t = 0, now()
+    -- Pickups are pooled and reused: forget counts for ones no longer in range (picked up, respawned elsewhere).
+    local seen = {}
+    for _, e in ipairs(magnetItems(here)) do
+        local a = addr(e.item)
+        if a then seen[a] = lootTries[a] end
+        if a and not near(e.loc, here, 60) then
+            local tr = seen[a] or { n = 0, at = -100 }
+            seen[a] = tr
+            -- Something we can't pick up (full, another player's) stops being pulled after a while.
+            if authority then
+                tr.n = tr.n + 1
+                if tr.n <= 30 then try(function() e.item:K2_TeleportTo(here, ZERO_ROT) end) end
+            elseif tr.n < cfg.loot.clientTries and t - tr.at >= cfg.loot.clientRetrySeconds
+                and sent < cfg.loot.clientPerTick then
+                tr.n, tr.at, sent = tr.n + 1, t, sent + 1
+                pcall(function() comp:ServerItemPickup(e.item) end)
             end
         end
     end
+    lootTries = seen
 end
 
 
@@ -1069,7 +1252,7 @@ local function attitude(myPawn, other)
     return nil
 end
 
-local function isFriendly(myPawn, e)
+function F.isFriendly(myPawn, e)
     if chainHas(e, IGNORE_CLASSES) then return true end
     if try(function() return e.bIsThornBloom end) == true then return true end
     return myPawn ~= nil and attitude(myPawn, e) == 0
@@ -1087,7 +1270,7 @@ end
 
 local headSocketCache = {} -- class name -> socket name or false
 
-local function headSocket(pawn, mesh)
+function F.headSocket(pawn, mesh)
     local cls = className(pawn)
     local sock = headSocketCache[cls]
     if sock == nil then
@@ -1188,7 +1371,7 @@ local function logPartClass(p, owner, kind)
 end
 
 -- Every part actor, from all listed classes (FindAllOf on the native parent alone missed the goblins' shields).
-local function allParts()
+function F.allParts()
     local seen, out = {}, {}
     for _, cls in ipairs(PARTS.classes) do
         for _, p in ipairs(FindAllOf(cls) or {}) do
@@ -1201,7 +1384,7 @@ end
 
 -- The shield an enemy carries, read from the enemy itself (ShieldComponent / its shield child actor).
 -- nil when it has none or the shield is broken.
-local function carriedShield(enemy)
+function F.carriedShield(enemy)
     -- Only the spiked-shield goblin has a ShieldComponent; the plain shield goblin (B_C1_Goblin_Soldier_C) just
     -- carries the B_GoblinShield child actor (v3.5.5 required the component and found no shields at all).
     local comp = try(function() return enemy[PARTS.shieldComponentProp] end)
@@ -1225,11 +1408,11 @@ end
 local shieldInfo = ""
 local function refreshParts()
     local sh, ex, owners = {}, {}, {}
-    local parts, seen = allParts()
+    local parts, seen = F.allParts()
     local bearers, holding = 0, 0
     for _, e in ipairs(enemies) do
         if valid(e) and valid(try(function() return e[PARTS.shieldActorProps[2]] end)) then bearers = bearers + 1 end
-        local s = valid(e) and carriedShield(e)
+        local s = valid(e) and F.carriedShield(e)
         if s then holding = holding + 1 end
         local a = s and addr(s)
         if a and not seen[a] then seen[a] = true; parts[#parts + 1] = s end
@@ -1269,7 +1452,7 @@ end
 local guardOf = {}
 local loggedLinks = {}
 
-local function refreshGuards()
+function F.refreshGuards()
     local map = {}
     for _, l in ipairs(FindAllOf(cfg.guards.linkClass) or {}) do
         if valid(l) then
@@ -1322,6 +1505,57 @@ local function refreshGuards()
             end
         end
     end
+    -- Casters (Troll Summoner): while their shield effect sits on an enemy, that enemy takes no damage.
+    -- The effect actor is attached to the shielded enemy; the caster is its owner, or the nearest caster alive.
+    for _, sc in ipairs(cfg.guards.shieldCasters or {}) do
+        local casters = {}
+        for _, cst in ipairs(FindAllOf(sc.casterClass) or {}) do
+            if valid(cst) and try(function() return cst.IsDead end) ~= true then casters[#casters + 1] = cst end
+        end
+        if #casters > 0 then
+            for _, fx in ipairs(FindAllOf(sc.effectClass) or {}) do
+                if valid(fx) and try(function() return fx.bHidden end) ~= true then
+                    local loc = try(function() return fx:K2_GetActorLocation() end)
+                    local protected = try(function() return fx:GetAttachParentActor() end)
+                    if not valid(protected) and isVec(loc) then
+                        -- Not attached: the enemy standing in the effect.
+                        local bestD
+                        for _, e in ipairs(enemies) do
+                            local el = valid(e) and try(function() return e:K2_GetActorLocation() end)
+                            if isVec(el) then
+                                local d = (el.X - loc.X) ^ 2 + (el.Y - loc.Y) ^ 2 + (el.Z - loc.Z) ^ 2
+                                if d < sc.attachRadius ^ 2 and (not bestD or d < bestD) then protected, bestD = e, d end
+                            end
+                        end
+                    end
+                    local caster = try(function() return fx:GetOwner() end)
+                    if not (valid(caster) and chainHas(caster, { [sc.casterClass] = true })) then
+                        caster = nil
+                        local pl = valid(protected) and try(function() return protected:K2_GetActorLocation() end)
+                        local bestD
+                        for _, cst in ipairs(casters) do
+                            local cl = try(function() return cst:K2_GetActorLocation() end)
+                            if isVec(cl) and isVec(pl) then
+                                local d = (cl.X - pl.X) ^ 2 + (cl.Y - pl.Y) ^ 2 + (cl.Z - pl.Z) ^ 2
+                                if not bestD or d < bestD then caster, bestD = cst, d end
+                            end
+                        end
+                    end
+                    local pa = valid(protected) and addr(protected)
+                    if pa and caster and pa ~= addr(caster) and not map[pa] then
+                        map[pa] = caster
+                        if cfg.writeProbe then
+                            local k = className(caster) .. ">" .. className(protected)
+                            if not loggedLinks[k] then
+                                loggedLinks[k] = true
+                                appendFile(ENEMIES_PATH, string.format("SHIELD %s protects %s\n", className(caster), className(protected)))
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
     guardOf = map
 end
 
@@ -1343,7 +1577,7 @@ local function blockedByShield(cam, point, targetLoc, gun)
     return false
 end
 
-local function partCenter(p)
+function F.partCenter(p)
     for _, c in ipairs(primitiveComponents(p)) do
         local v = try(function() return c:K2_GetComponentLocation() end)
         if isVec(v) then return vec(v) end
@@ -1361,7 +1595,7 @@ local function aimPoints(pawn, actorLoc, cam)
     if S.aimExplosives and cam then
         for _, p in ipairs(explosivesByOwner[addr(pawn)] or {}) do
             if valid(p) then
-                local e = partCenter(p)
+                local e = F.partCenter(p)
                 if e and near(e, actorLoc, 1500) and Aim.facesCamera(e, actorLoc, cam, PARTS.explosiveCenterRadius) then
                     pts[#pts + 1] = { point = e, kind = "explosive" }
                 end
@@ -1388,7 +1622,7 @@ local function aimPoints(pawn, actorLoc, cam)
     -- Head socket before the game's auto-aim point: on big bosses the auto-aim point is mid-body.
     local mesh = try(function() return pawn.Mesh end)
     if valid(mesh) then
-        local sock = headSocket(pawn, mesh)
+        local sock = F.headSocket(pawn, mesh)
         if sock then
             local v = try(function() return mesh:GetSocketLocation(fname(sock)) end)
             if isVec(v) then pts[#pts + 1] = { point = vec(v), kind = "head" } end
@@ -1458,7 +1692,98 @@ local function lineClear(me, from, point, targetAddr)
     if isVec(hit.Location) and near(hit.Location, point, LOF.pointTolerance) then return true end
     local o = hitActor(hit)
     if o and targetAddr and addr(o) == targetAddr then return true end
-    return false, o and className(o) or "terrain"
+    return false, o and className(o) or "terrain", o
+end
+
+-- Enemy bodies don't block any trace channel we can use (checked live 2026-11-15: traces passed straight
+-- through 7 enemies), so other enemies in the way are found from their collision capsules instead.
+local capsuleFrame = { at = -1, list = {} }
+local function enemyCapsules()
+    local t = now()
+    if capsuleFrame.at == t then return capsuleFrame.list end
+    local list = {}
+    for _, e in ipairs(enemies) do
+        if valid(e) and try(function() return e.IsDead end) ~= true then
+            local loc = try(function() return e:K2_GetActorLocation() end)
+            local cap = try(function() return e.CapsuleComponent end)
+            local h = valid(cap) and try(function() return cap:GetScaledCapsuleHalfHeight() end)
+            local r = valid(cap) and try(function() return cap:GetScaledCapsuleRadius() end)
+            if isVec(loc) and type(h) == "number" and type(r) == "number" then
+                list[#list + 1] = { actor = e, a = addr(e), loc = vec(loc), up = upVector(e), h = h, r = r * LOF.bodyRadiusScale }
+            end
+        end
+    end
+    capsuleFrame.at, capsuleFrame.list = t, list
+    return list
+end
+
+-- The nearest other enemy whose body the line from -> point passes through, or nil.
+local function enemyInTheWay(from, point, targetAddr)
+    local best, bestS
+    for _, c in ipairs(enemyCapsules()) do
+        if c.a ~= targetAddr then
+            local s = Aim.segmentHitsCapsule(from, point, c.loc, c.up, c.h, c.r)
+            -- Only bodies clearly in front of the point (not the target's neighbour behind or beside it).
+            if s and s < LOF.inFrontFraction and (not bestS or s < bestS) then best, bestS = c.actor, s end
+        end
+    end
+    return best
+end
+
+-- "God zone" bodies: parts of an enemy that take no damage (physics material tagged Gameplay.Zone.God,
+-- e.g. the Troll Tamer's wooden mask). Shapes come from the physics asset (config godZones); each is placed
+-- from its bone every frame. Returns true when the line from -> point passes through one.
+local function hitsGodZone(pawn, from, point)
+    local zones = cfg.aim.godZones[className(pawn)]
+    if not zones then return false end
+    local mesh = try(function() return pawn.Mesh end)
+    if not valid(mesh) then return false end
+    for _, z in ipairs(zones) do
+        local bl = try(function() return mesh:GetSocketLocation(fname(z.bone)) end)
+        local br = try(function() return mesh:GetSocketRotation(fname(z.bone)) end)
+        if isVec(bl) and br then
+            local bf, brt, bu = Aim.rotAxes(br.Pitch, br.Yaw, br.Roll)
+            for _, sh in ipairs(z.shapes) do
+                local c = Aim.toWorld(bl, bf, brt, bu, sh.center[1], sh.center[2], sh.center[3])
+                -- The shape's own rotation inside the bone.
+                local lf, lr, lu = Aim.rotAxes(sh.rot and sh.rot[1], sh.rot and sh.rot[2], sh.rot and sh.rot[3])
+                local function w(v) return Aim.toWorld({ X = 0, Y = 0, Z = 0 }, bf, brt, bu, v.X, v.Y, v.Z) end
+                local f, r, u = w(lf), w(lr), w(lu)
+                if sh.kind == "box" then
+                    local box = { center = c, axes = { f, r, u },
+                        min = { X = -sh.size[1] / 2, Y = -sh.size[2] / 2, Z = -sh.size[3] / 2 },
+                        max = { X = sh.size[1] / 2, Y = sh.size[2] / 2, Z = sh.size[3] / 2 } }
+                    if Aim.segmentHitsBox(from, point, box, LOF.godMargin) then return true end
+                elseif sh.kind == "sphere" then
+                    if Aim.segmentHitsCapsule(from, point, c, u, sh.radius, sh.radius + LOF.godMargin) then return true end
+                elseif sh.kind == "capsule" then
+                    -- UE capsules (sphyl) run along their local Z; Length is between the two sphere centers.
+                    local half = sh.length / 2 + sh.radius
+                    if Aim.segmentHitsCapsule(from, point, c, u, half, sh.radius + LOF.godMargin) then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- The hostile enemy a blocking actor belongs to (the enemy itself, or something attached to it that isn't
+-- a shield), or nil.
+local function blockingEnemy(o, targetAddr)
+    if not valid(o) then return nil end
+    for _ = 1, 2 do
+        local a = addr(o)
+        if a == targetAddr then return nil end
+        for _, e in ipairs(enemies) do
+            if addr(e) == a then return e end
+        end
+        for _, s in ipairs(shields) do
+            if addr(s) == a then return nil end
+        end
+        o = try(function() return o:GetAttachParentActor() end)
+        if not valid(o) then return nil end
+    end
+    return nil
 end
 
 -- Bones to try when the usual aim points are covered (thinned out, no IK/root/weapon helper bones).
@@ -1499,18 +1824,23 @@ local lofCache = {} -- target address -> { at = time, kind = chosen kind }
 -- Picks a point on the target that a shot can actually reach. Keeps the planned point when it is clear;
 -- otherwise tries, in order: the other aim points (weak spot, head, auto-aim point, upper body), the
 -- enemy's bones nearest the weak spot, and finally the plan (over the shield, or into the cover).
-function lineOfFirePoint(pc, pawn, actorLoc, cam, planned, plannedKind, alt)
+function lineOfFirePoint(pc, pawn, actorLoc, cam, planned, plannedKind, alt, switchToBlocker)
     local me = localPawn(pc)
     local ta = addr(pawn)
     local function clear(p)
         if S.aimOverShields and #shields > 0 and blockedByShield(cam, p, actorLoc, gunOrigin) then
             return false, "shield"
         end
-        local ok, what = lineClear(me, cam, p, ta)
-        if not ok then return false, what end
+        local inWay = enemyInTheWay(cam, p, ta) or (gunOrigin and enemyInTheWay(gunOrigin, p, ta))
+        if inWay then return false, className(inWay), inWay end
+        if hitsGodZone(pawn, cam, p) or (gunOrigin and hitsGodZone(pawn, gunOrigin, p)) then
+            return false, "damage-proof part (mask / stone)"
+        end
+        local ok, what, obj = lineClear(me, cam, p, ta)
+        if not ok then return false, what, obj end
         if gunOrigin then
-            ok, what = lineClear(me, gunOrigin, p, ta)
-            if not ok then return false, what end
+            ok, what, obj = lineClear(me, gunOrigin, p, ta)
+            if not ok then return false, what, obj end
         end
         return true
     end
@@ -1518,15 +1848,45 @@ function lineOfFirePoint(pc, pawn, actorLoc, cam, planned, plannedKind, alt)
     local raised = plannedKind and plannedKind:find("over shield", 1, true)
     local blockedBy = "shield"
     if not raised then
-        local ok, what = clear(planned)
+        local ok, what, obj = clear(planned)
         if ok then lofCache[ta] = nil; return planned, plannedKind end
         blockedBy = what
         status.lineOfFire = string.format("%s blocked by %s", plannedKind or "?", what or "?")
+        -- Another enemy is in the way: shoot that one instead (the caller switches targets).
+        local other = switchToBlocker and blockingEnemy(obj, ta)
+        if other then return planned, plannedKind, other end
     end
     local pts, info
     if alt then pts, info = alt, {} else pts, info = aimPoints(pawn, actorLoc, cam) end
-    local cands = {}
-    for _, p in ipairs(pts) do cands[#cands + 1] = p end
+    -- Order: weak spot (and its edges), head (and its edges, head bones), then the body.
+    local tier = { {}, {}, {} }
+    local function edges(p, kind, r, list)
+        -- Points around p across the line of sight, so a partly covered weak spot / head still gets hit.
+        local d = { X = p.X - cam.X, Y = p.Y - cam.Y, Z = p.Z - cam.Z }
+        local len = math.sqrt(d.X * d.X + d.Y * d.Y + d.Z * d.Z)
+        if len < 1 then return end
+        d = { X = d.X / len, Y = d.Y / len, Z = d.Z / len }
+        local right = { X = -d.Y, Y = d.X, Z = 0 }
+        local rl = math.sqrt(right.X * right.X + right.Y * right.Y)
+        if rl < 1e-6 then right = { X = 1, Y = 0, Z = 0 } else right = { X = right.X / rl, Y = right.Y / rl, Z = 0 } end
+        local up = { X = right.Y * d.Z, Y = -right.X * d.Z, Z = right.X * d.Y - right.Y * d.X }
+        for _, o in ipairs({ { 0, 1 }, { 1, 0 }, { -1, 0 }, { 0, -1 }, { 0.7, 0.7 }, { -0.7, 0.7 } }) do
+            local q = { X = p.X + (right.X * o[1] + up.X * o[2]) * r, Y = p.Y + (right.Y * o[1] + up.Y * o[2]) * r,
+                        Z = p.Z + (right.Z * o[1] + up.Z * o[2]) * r }
+            list[#list + 1] = { point = q, kind = kind .. " edge" }
+        end
+    end
+    for _, p in ipairs(pts) do
+        if alt or p.kind == "explosive" or p.kind == "weakspot" then
+            tier[1][#tier[1] + 1] = p
+            if p.kind == "weakspot" then edges(p.point, "weakspot", LOF.weakSpotEdge, tier[1]) end
+        elseif p.kind == "head" then
+            tier[2][#tier[2] + 1] = p
+            edges(p.point, "head", LOF.headEdge, tier[2])
+        else
+            tier[3][#tier[3] + 1] = p
+        end
+    end
     if not alt and valid(info.mesh) then
         local ref = pts[1] and pts[1].point or actorLoc
         local bones = {}
@@ -1534,17 +1894,34 @@ function lineOfFirePoint(pc, pawn, actorLoc, cam, planned, plannedKind, alt)
             local v = try(function() return info.mesh:GetSocketLocation(fname(b)) end)
             if isVec(v) and Aim.nearBody(vec(v), actorLoc, info.up, info.half, info.radius) then
                 local d = math.sqrt((v.X - ref.X) ^ 2 + (v.Y - ref.Y) ^ 2 + (v.Z - ref.Z) ^ 2)
-                bones[#bones + 1] = { point = vec(v), kind = "body " .. b, d = d }
+                local headish = false
+                for _, pat in ipairs(LOF.headBones) do
+                    if b:lower():find(pat, 1, true) then headish = true; break end
+                end
+                bones[#bones + 1] = { point = vec(v), kind = (headish and "head " or "body ") .. b, d = d, head = headish }
             end
         end
         table.sort(bones, function(a, b) return a.d < b.d end)
-        for _, b in ipairs(bones) do cands[#cands + 1] = b end
+        for _, b in ipairs(bones) do
+            local t = b.head and tier[2] or tier[3]
+            t[#t + 1] = b
+        end
     end
-    -- The point chosen a moment ago first, so the aim does not flicker between equally good points.
+    local cands = {}
+    for _, t in ipairs(tier) do for _, p in ipairs(t) do cands[#cands + 1] = p end end
+    -- The point chosen a moment ago first (no flicker between equally good points), but never ahead of a
+    -- better tier: a body point doesn't hold off a weak spot or head that has come into view.
     local c = lofCache[ta]
     if c and now() - c.at < LOF.stickySeconds then
+        local tierOf = {}
+        for ti, t in ipairs(tier) do for _, p in ipairs(t) do tierOf[p] = ti end end
         for i, p in ipairs(cands) do
-            if p.kind == c.kind then table.remove(cands, i); table.insert(cands, 1, p); break end
+            if p.kind == c.kind then
+                local firstSame = 1
+                for j, q in ipairs(cands) do if tierOf[q] == tierOf[p] then firstSame = j; break end end
+                table.remove(cands, i); table.insert(cands, firstSame, p)
+                break
+            end
         end
     end
     for _, p in ipairs(cands) do
@@ -1632,7 +2009,7 @@ do
 end
 
 -- One line per enemy class seen, so aim points can be checked after a session (enemies.txt).
-local function logEnemyClass(e, myPawn)
+function F.logEnemyClass(e, myPawn)
     local cname = className(e)
     if loggedEnemyClasses[cname] then return end
     loggedEnemyClasses[cname] = true
@@ -1654,7 +2031,7 @@ local function logEnemyClass(e, myPawn)
     appendFile(ENEMIES_PATH, line)
 end
 
-local function refreshEnemies(pc)
+function F.refreshEnemies(pc)
     local myPawn = localPawn(pc)
     local players = {}
     for _, p in ipairs(FindAllOf("EXPlayerCharacter") or {}) do
@@ -1664,8 +2041,8 @@ local function refreshEnemies(pc)
     for _, c in ipairs(FindAllOf("EXCharacter") or {}) do
         local a = addr(c)
         if a and not players[a] and valid(c) then
-            if cfg.writeProbe then pcall(logEnemyClass, c, myPawn) end
-            if not isFriendly(myPawn, c) then list[#list + 1] = c end
+            if cfg.writeProbe then pcall(F.logEnemyClass, c, myPawn) end
+            if not F.isFriendly(myPawn, c) then list[#list + 1] = c end
         end
     end
     enemies = list
@@ -1692,7 +2069,7 @@ local function relVec(v, origin)
 end
 
 -- Ping: writes what's under the crosshair to pings.txt (for checking objects/enemies later). Changes nothing.
-local function pingObject(pc)
+function F.pingObject(pc)
     local camMgr = try(function() return pc.PlayerCameraManager end)
     local camLoc = valid(camMgr) and try(function() return camMgr:GetCameraLocation() end)
     local camRot = valid(camMgr) and try(function() return camMgr:GetCameraRotation() end)
@@ -1753,14 +2130,14 @@ local function pingObject(pc)
 end
 
 local markKeyName, markKey, markWasDown = nil, nil, false
-local function markKeyTick(pc)
+function F.markKeyTick(pc)
     if markKeyName ~= S.aimSupplyKey then
         markKeyName = S.aimSupplyKey
         markKey = { KeyName = fname(markKeyName) }
     end
     local down = try(function() return pc:IsInputKeyDown(markKey) end) == true
     if down and not markWasDown then
-        local ok, err = pcall(pingObject, pc)
+        local ok, err = pcall(F.pingObject, pc)
         if not ok then reportError("ping", err) end
     end
     markWasDown = down
@@ -1775,7 +2152,7 @@ local clayDwell = { key = nil, frames = 0, firing = 0 }
 local lastFrameAt = nil
 local curDt = 0 -- seconds since the previous frame (set in frameTick)
 
-local function frameDelta()
+function F.frameDelta()
     local t = now()
     local d = lastFrameAt and (t - lastFrameAt) or 0
     lastFrameAt = t
@@ -1790,15 +2167,15 @@ local shotThisFrame = nil
 local shotsSeen = 0
 local lastFireT, lastWeaponAddr = nil, nil
 
-local function equippedWeapon()
+function F.equippedWeapon()
     for _, w in ipairs(cachedOwned("EXRangedWeaponInstance")) do
         if try(function() return w.bIsEquipped end) == true then return w end
     end
     return nil
 end
 
-local function detectShot()
-    local w = equippedWeapon()
+function F.detectShot()
+    local w = F.equippedWeapon()
     local t = w and try(function() return w:GetTimeSinceLastInteractedWith() end)
     if type(t) ~= "number" then lastFireT, lastWeaponAddr = nil, nil; return nil end
     local wa = addr(w)
@@ -1810,7 +2187,7 @@ end
 
 local function aimTick(pc)
     if not S.aimAssist then status.aimTarget = ""; lock.key = nil; return end
-    if not wantsAim(pc) then status.aimTarget = ""; lock.key = nil; return end
+    if not wantsAim(pc) then status.aimTarget = ""; status.lineOfFire = ""; lock.key = nil; return end
 
     local camMgr = try(function() return pc.PlayerCameraManager end)
     if not valid(camMgr) then return end
@@ -1841,7 +2218,7 @@ local function aimTick(pc)
         if d > 1 and d <= maxDist + 500 and (isSupply or (dx * fx + dy * fy + dz * fz) / d >= cosWide) then
             if isSupply then
                 candidates[#candidates + 1] = { actor = actor, point = vec(loc), kind = "supply", key = addr(actor) }
-            elseif isAlive(actor) then
+            elseif isAlive(actor) and not F.immune[addr(actor)] then
                 if S.aimSkipBurrowed and isBurrowed(actor) then
                     -- Ducked mushroom: its body blocks all damage, but the hat on top can still be shot.
                     local hat = hatPoints(actor)
@@ -1934,7 +2311,20 @@ local function aimTick(pc)
     -- Enemies: make sure the shot is not stopped by terrain, walls or a shield on the way.
     if S.aimLineOfSight and best.kind ~= "supply" and best.loc then
         status.lineOfFire = ""
-        best.point, best.kind = lineOfFirePoint(pc, best.actor, best.loc, cam, best.point, best.kind, best.alt)
+        local p, k, blocker = lineOfFirePoint(pc, best.actor, best.loc, cam, best.point, best.kind, best.alt, true)
+        best.point, best.kind = p, k
+        -- A closer enemy is between you and the target's aim point: target the closer one instead.
+        local bl = blocker and isAlive(blocker) and try(function() return blocker:K2_GetActorLocation() end)
+        if isVec(bl) then
+            local behind = className(best.actor)
+            local bp, bk = aimPoint(blocker, vec(bl), cam)
+            bp, bk = lineOfFirePoint(pc, blocker, vec(bl), cam, bp, bk)
+            best = { actor = blocker, point = bp, kind = bk .. ", in front of " .. behind, key = addr(blocker),
+                     loc = vec(bl) }
+            lock.key, lock.lostAt = best.key, nil
+            angle = Aim.angleTo(cam, camR, bp, nil, true) or angle
+            status.lineOfFire = string.format("switched: %s was in the way of %s", className(blocker), behind)
+        end
     end
 
     -- One shot per clay: once a shot goes out while we're already on this clay, move to the next one.
@@ -1981,15 +2371,21 @@ local function aimTick(pc)
 end
 
 local function frameTick()
-    curDt = frameDelta()
+    curDt = F.frameDelta()
     local pc = localPC()
     if not pc or not localPawn(pc) then return end
-    shotThisFrame = detectShot()
+    shotThisFrame = F.detectShot()
     if shotThisFrame then shotsSeen = shotsSeen + 1 end
     healthFrame()
-    markKeyTick(pc)
+    F.markKeyTick(pc)
     aimTick(pc)
-    local ok, err = pcall(minimapFrame, pc)
+    local dots = nil
+    if S.minimapLootDots then
+        local pawn = localPawn(pc)
+        local here = pawn and try(function() return pawn:K2_GetActorLocation() end)
+        if isVec(here) then dots = magnetItems(vec(here)) end
+    end
+    local ok, err = pcall(F.minimapFrame, pc, dots)
     if not ok then reportError("minimap", err) end
 end
 
@@ -1999,7 +2395,7 @@ end
 
 local probeWritten = false
 
-local function describeClass(lines, obj)
+function F.describeClass(lines, obj)
     local cls = try(function() return obj:GetClass() end)
     local depth = 0
     while valid(cls) and depth < 6 do
@@ -2028,7 +2424,7 @@ local function writeProbe(pc)
     local lines = { "Guns & Dragons Trainer probe " .. VERSION, "role=" .. status.role, "" }
     local function section(title, obj)
         lines[#lines + 1] = "== " .. title
-        if valid(obj) then describeClass(lines, obj) else lines[#lines + 1] = "  (no instance)" end
+        if valid(obj) then F.describeClass(lines, obj) else lines[#lines + 1] = "  (no instance)" end
     end
     section("EXHealthSet (ours)", cachedOwned("EXHealthSet")[1])
     section("Stats (ours)", statSets()[1])
@@ -2045,7 +2441,7 @@ end
 -- Settings / status exchange with the GUI
 ---------------------------------------------------------------------------
 
-local function loadSettings()
+function F.loadSettings()
     local text = readFile(SETTINGS_PATH)
     if text == nil then
         writeFileAtomic(SETTINGS_PATH, Settings.toIni(S))
@@ -2097,8 +2493,8 @@ local function writeStatus()
         "minimapIcons=" .. (function()
             local shown = 0
             for _, p in ipairs(mm.pool) do if p.shown then shown = shown + 1 end end
-            return string.format("%d drawn of %d (scale %.4f px/cm, edge %.0f px, %d slots)",
-                shown, #mm.drawList, mm.scale, mm.edge, #mm.pool)
+            return string.format("%d drawn of %d badges + %d loot dots (scale %.4f px/cm, edge %.0f px, %d slots)",
+                shown - (mm.dotsShown or 0), #mm.drawList, mm.dotsShown or 0, mm.scale, mm.edge, #mm.pool)
         end)(),
         "lastPing=" .. status.lastMarked,
         "lastError=" .. status.lastError:gsub("[\r\n]", " "),
@@ -2120,6 +2516,23 @@ local OWNED_CLASSES = { "EXHealthSet", "EXRangedWeaponInstance", "EXInventoryIte
     "EXEnergyMagazineAttributeSet", cfg.stats.set }
 
 local slowTicks = 0
+-- Enemies that are temporarily immune by an ability flag (Troll Hunter Elite hiding in a bush:
+-- GA_NPC_Troll_Hunter_Elite_BushAmbush.bAmbushDamageImmune). The ability object's outer is the enemy.
+F.immune = {}
+function F.refreshImmune()
+    local set = {}
+    for _, f in ipairs(cfg.aim.immuneFlags) do
+        for _, ab in ipairs(FindAllOf(f.class) or {}) do
+            if valid(ab) and try(function() return ab[f.flag] end) == true then
+                local owner = try(function() return ab:GetOuter() end)
+                local a = valid(owner) and addr(owner)
+                if a then set[a] = className(owner) end
+            end
+        end
+    end
+    F.immune = set
+end
+
 local function slowTick()
     slowTicks = slowTicks + 1
     local pc = localPC()
@@ -2136,31 +2549,31 @@ local function slowTick()
     end
 
     -- Our own attribute sets / weapons; rescanned once a second (weapon pickups, respawns).
-    local owners = localOwners(pc)
+    local owners = F.localOwners(pc)
     local rescan = slowTicks % 10 == 1
     for _, cls in ipairs(OWNED_CLASSES) do ownedInstances(cls, owners, rescan) end
 
     if refreshNow then
-        if S.aimAssist then refreshEnemies(pc) end
+        if S.aimAssist then F.refreshEnemies(pc) end
         if S.aimSupplies or S.highlightSupplies then refreshSupplies() else supplies = {} end
-        if S.lootMagnet and hasAuthority() then refreshLoot() end
-        if S.aimAssist then refreshParts(); refreshGuards() end
-        if S.highlightSupplies or S.highlightChests or S.highlightSecretWalls then highlightTick() else highlightOff() end
+        if S.lootMagnet or S.minimapLootDots then refreshLoot() end
+        if S.aimAssist then refreshParts(); F.refreshGuards(); F.refreshImmune() end
+        if S.highlightSupplies or S.highlightChests or S.highlightSecretWalls then F.highlightTick() else F.highlightOff() end
     end
 
     -- Host / solo only.
-    if S.infiniteHealth and hasAuthority() then healthTick(pc) else healthOff(pc) end
-    if S.infiniteAmmo and hasAuthority() then ammoTick() else release("ammo") end
-    if S.infiniteArmor and hasAuthority() then armorTick() end
-    if S.lootMagnet and hasAuthority() then lootMagnetTick(pawn) end
+    if S.infiniteHealth and hasAuthority() then F.healthTick(pc) else F.healthOff(pc) end
+    if S.infiniteAmmo and hasAuthority() then F.ammoTick() else release("ammo") end
+    if S.infiniteArmor and hasAuthority() then F.armorTick() end
+    if S.infiniteRevives and hasAuthority() then reviveTick(pc) else reviveOff() end
 
     -- Own stats, any role.
-    if S.noDashCooldown then dashTick() else release("dash") end
-    if S.fireRate then fireRateTick() else release("fireRate") end
+    if S.noDashCooldown then F.dashTick() else release("dash") end
+    if S.fireRate then F.fireRateTick() else release("fireRate") end
     if S.noSpread then spreadOn() else spreadOff() end
-    if S.lootMagnet then lootRangeTick() else release("loot") end
+    if S.lootMagnet then F.lootRangeTick(); F.lootMagnetTick(pawn, hasAuthority()) else release("loot") end
     if S.reloadSpeed then reloadTick() else release("reload") end
-    if S.moveSpeed then moveTick(pawn) else release("move") end
+    if S.moveSpeed then F.moveTick(pawn) else release("move") end
 
     -- Probe once our real character exists (it owns a health set); the title screen has none.
     if cfg.writeProbe and not probeWritten and #cachedOwned("EXHealthSet") > 0 then
@@ -2171,7 +2584,7 @@ local function slowTick()
 end
 
 local function ioTick()
-    local ok, err = pcall(loadSettings)
+    local ok, err = pcall(F.loadSettings)
     if not ok then reportError("settings", err) end
     ok, err = pcall(writeStatus)
     if not ok then reportError("status", err) end
@@ -2206,7 +2619,7 @@ local function startLoop(name, fn, ms, frames)
     return "async"
 end
 
-local function launchGui()
+function F.launchGui()
     if not cfg.autoLaunchGui then return end
     local exe = MOD_DIR .. "\\" .. cfg.guiExe
     local f = io.open(exe, "rb")
@@ -2222,7 +2635,7 @@ end
 
 -- Load settings before anything else so the first frame already uses saved toggles.
 do
-    local ok, err = pcall(loadState)
+    local ok, err = pcall(F.loadState)
     if not ok then reportError("state", err) end
 end
 ioTick()
@@ -2232,7 +2645,7 @@ if cfg.writeProbe then
 end
 -- Everything slow (the GUI launch can block for about a second) happens BEFORE the loops start: once they
 -- start they run on the game thread, and nothing else in this file may run at the same time.
-launchGui()
+F.launchGui()
 log("v%s loading from %s", VERSION, MOD_DIR)
 
 -- Last statements of the file: start the loops.

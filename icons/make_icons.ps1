@@ -100,3 +100,16 @@ $dark = New-Object System.Drawing.SolidBrush (C 26 31 40)
 $b.G.FillRectangle($dark, 30, 20, 4, 16)           # cross
 $b.G.FillRectangle($dark, 25, 25, 14, 4)
 Save-Badge $b "event_grave.png"
+
+# Loot dot (magnet items on the minimap): small bright gold dot with a dark rim, drawn at ~9 px.
+$bmp = New-Object System.Drawing.Bitmap 32, 32, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$g = [System.Drawing.Graphics]::FromImage($bmp)
+$g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+$g.Clear([System.Drawing.Color]::Transparent)
+$g.FillEllipse((New-Object System.Drawing.SolidBrush (C 12 15 20 235)), 1, 1, 30, 30)
+$g.FillEllipse((New-Object System.Drawing.SolidBrush (C 255 214 90)), 5, 5, 22, 22)
+$g.FillEllipse((New-Object System.Drawing.SolidBrush (C 255 246 200)), 10, 8, 8, 7)
+$g.Dispose()
+$bmp.Save((Join-Path $out "loot_dot.png"), [System.Drawing.Imaging.ImageFormat]::Png)
+$bmp.Dispose()
+Write-Host "wrote loot_dot.png"

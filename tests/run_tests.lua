@@ -360,10 +360,108 @@ end
 
 local ALL_ON = "infiniteHealth=1\ninfiniteAmmo=1\ninfiniteArmor=1\naimAssist=1\naimFov=10\naimMode=hold\naimHoldKey=RightMouseButton\n"
 
+test("main: keeps headroom under Lua's 200-locals limit (UE4SS adds its own when loading)", function()
+    -- v3.9.0 compiled here but failed to load in the game at ~200 top-level locals. Require 25 spare.
+    local src = assert(readFile(SCRIPTS .. SEP .. "main.lua"))
+    local pad = {}
+    for i = 1, 25 do pad[#pad + 1] = "local _pad" .. i .. " = " .. i end
+    local fn, err = load(table.concat(pad, "\n") .. "\n" .. src, "=main.lua(padded)", "t")
+    truthy(fn, err)
+end)
+
 test("main: registers per-frame aim loop and game-thread loops", function()
     local W = makeWorld()
     W.load(ALL_ON)
     eq(#W.loops, 3); eq(W.loops[1].kind, "frames"); eq(W.loops[2].kind, "delay"); eq(W.loops[3].kind, "delay")
+end)
+
+test("health/armor: refilled through the game's attribute setter so the HUD updates; teammate untouched", function()
+    local W = makeWorld({ role = "host" })
+    local calls = {}
+    local function asc(p, who)
+        return W.obj("EXAbilitySystemComponent", { "EXAbilitySystemComponent" }, {
+            GetOwner = function() return p.ps end,
+            SetAttributeBaseValueByName = function(_, setName, attr, v)
+                calls[#calls + 1] = { who = who, set = setName, attr = attr.name, v = v }
+                p.health[attr.name].BaseValue = v; p.health[attr.name].CurrentValue = v
+            end })
+    end
+    asc(W.me, "me"); asc(W.mate, "mate")
+    W.load(ALL_ON)
+    W.tick(2)
+    eq(W.me.health.Health.CurrentValue, 100); eq(W.me.health.Shield.CurrentValue, 50)
+    eq(W.mate.health.Health.CurrentValue, 20, "teammate untouched")
+    local n = 0
+    for _, c in ipairs(calls) do
+        eq(c.who, "me")
+        eq(c.set, "EXHealthSet")
+        n = n + 1
+    end
+    truthy(n >= 2, "health and shield set through the game")
+    -- Full and announced: no more calls every frame.
+    local before = #calls
+    W.tick(5)
+    eq(#calls, before, "no calls while full")
+    -- Damage taken somehow: refilled through the setter again.
+    W.me.health.Health.CurrentValue = 40
+    W.tick(1)
+    eq(calls[#calls].attr, "Health"); eq(calls[#calls].v, 100)
+end)
+
+test("health: already full in memory -> HUD is nudged once (value changes, then back to full)", function()
+    local W = makeWorld({ role = "host" })
+    W.me.health.Health = W.attr(100)
+    local seen = {}
+    W.obj("EXAbilitySystemComponent", { "EXAbilitySystemComponent" }, {
+        GetOwner = function() return W.me.ps end,
+        SetAttributeBaseValueByName = function(_, setName, attr, v)
+            if attr.name == "Health" then seen[#seen + 1] = v end
+            W.me.health[attr.name].CurrentValue = v
+        end })
+    W.load(ALL_ON)
+    W.tick(4)
+    eq(#seen, 2, "nudge + full")
+    truthy(seen[1] < 100); eq(seen[2], 100)
+end)
+
+test("revives: count kept (through the game's setter), used counter held, teammate untouched", function()
+    local W = makeWorld({ role = "host" })
+    W.me.stats.NumResurrectCount = { BaseValue = 0, CurrentValue = 2 }   -- 2 from bonuses
+    W.mate.stats.NumResurrectCount = { BaseValue = 0, CurrentValue = 2 }
+    W.me.ps.ResurrectionCount = 0
+    local calls = {}
+    W.obj("EXAbilitySystemComponent", { "EXAbilitySystemComponent" }, {
+        GetOwner = function() return W.me.ps end,
+        SetAttributeBaseValueByName = function(_, setName, attr, v)
+            calls[#calls + 1] = { set = setName, attr = attr.name, v = v }
+            local a = W.me.stats[attr.name]
+            a.CurrentValue = a.CurrentValue + (v - a.BaseValue); a.BaseValue = v
+        end })
+    W.load("infiniteRevives=1\n")
+    W.tick(2)
+    eq(#calls, 0, "nothing to do while the count is full")
+    -- A revive is used: the game drops the count and bumps the used counter.
+    W.me.stats.NumResurrectCount.BaseValue = -1; W.me.stats.NumResurrectCount.CurrentValue = 1
+    W.me.ps.ResurrectionCount = 1
+    W.mate.stats.NumResurrectCount.CurrentValue = 1
+    W.tick(1)
+    eq(W.me.stats.NumResurrectCount.CurrentValue, 2, "count back")
+    eq(calls[1].set, "EXRogueLiteAttributeSet"); eq(calls[1].attr, "NumResurrectCount"); eq(calls[1].v, 0)
+    eq(W.me.ps.ResurrectionCount, 0, "used counter held")
+    eq(W.mate.stats.NumResurrectCount.CurrentValue, 1, "teammate untouched")
+    -- Switched off: the game's numbers are left alone again.
+    W.load("infiniteRevives=0\n", true)
+    W.me.stats.NumResurrectCount.CurrentValue = 1
+    W.tick(2)
+    eq(W.me.stats.NumResurrectCount.CurrentValue, 1)
+end)
+
+test("revives: none to start with -> at least one is kept available", function()
+    local W = makeWorld({ role = "host" })
+    W.me.stats.NumResurrectCount = { BaseValue = 0, CurrentValue = 0 }
+    W.load("infiniteRevives=1\n")
+    W.tick(2)
+    eq(W.me.stats.NumResurrectCount.CurrentValue, 1)
 end)
 
 test("main: host -> refills only this PC's health/armor/ammo, teammate untouched", function()
@@ -728,9 +826,29 @@ test("loot magnet: host pulls pickups within the radius to me and widens pickup 
     eq(W.me.stats.ItemDetectionRange.CurrentValue, 3000); eq(W.mate.stats.ItemDetectionRange.CurrentValue, 500)
 end)
 
-test("loot magnet: client does not move pickups", function()
-    local W = lootWorld("client")
-    eq(W.coin.loc.X, 1500)
+test("loot magnet: joined -> asks the host to pick up items in range (game's pickup request), moves nothing", function()
+    local W = makeWorld({ role = "client" })
+    W.me.pawn.K2_GetActorLocation = function() return { X = 100, Y = 100, Z = 0 } end
+    local asked = {}
+    W.me.pawn.ItemDetectionComponent = W.obj("EXItemDetectionComponent", {}, {
+        ServerItemPickup = function(_, item) asked[item] = (asked[item] or 0) + 1 end })
+    local function item(cls, loc, supers)
+        return W.obj(cls, { "EXAutoCollectObject" }, { _supers = supers, loc = loc,
+            K2_GetActorLocation = function(self) return self.loc end,
+            K2_TeleportTo = function(self, l) self.loc = { X = l.X, Y = l.Y, Z = l.Z } end })
+    end
+    local coin = item("B_Coin_C", { X = 1500, Y = 100, Z = 0 })
+    local far = item("B_Coin_C", { X = 9000, Y = 100, Z = 0 })
+    local excl = item("B_Exclusive_C", { X = 600, Y = 100, Z = 0 }, { "EXExclusiveAutoCollectObject" })
+    W.load("lootMagnet=1\nlootMagnetRadius=30\n")
+    W.tick(6)
+    eq(coin.loc.X, 1500, "not moved (the host owns it)")
+    truthy((asked[coin] or 0) >= 1, "pickup requested")
+    eq(asked[far], nil, "outside the radius"); eq(asked[excl], nil, "per-player drops left alone")
+    -- Something the host refuses (full inventory) is not requested forever.
+    W.clock = W.clock + 0
+    for _ = 1, 100 do W.clock = W.clock + 0.6; W.tick(1) end
+    eq(asked[coin], 6, "gives up after a few requests")
 end)
 
 test("main: enemies.txt lists each enemy class once with its aim points", function()
@@ -921,6 +1039,131 @@ test("line of fire: a rock in front of a low weak spot -> aims at a part the sho
     truthy(st.lineOfFire:find("weakspot blocked by StaticMeshActor", 1, true), st.lineOfFire)
     local dx, dy, dz = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
     truthy(dz / dx * 1000 > -20, "aims above the rock")
+end)
+
+test("line of fire: another enemy in the way of the weak spot -> target the closer enemy instead", function()
+    local W = makeWorld()
+    local back = W.enemy("B_Back_C", { X = 2000, Y = 10, Z = 0 }, { weakSpot = { X = 2000, Y = 10, Z = 40 } })
+    local front = W.enemy("B_Front_C", { X = 1000, Y = 30, Z = 0 }, { weakSpot = { X = 1000, Y = 30, Z = 50 } })
+    W.blockers = { { box = axisBox({ X = 1000, Y = 30, Z = 20 }, { X = 40, Y = 40, Z = 90 }), owner = front } }
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    local st = W.status()
+    truthy(st.aimTarget:find("^B_Front_C"), st.aimTarget)
+    truthy(st.aimTarget:find("in front of B_Back_C", 1, true), st.aimTarget)
+    truthy(st.lineOfFire:find("switched"), st.lineOfFire)
+    assertAimedAt(W, { X = 1000, Y = 30, Z = 50 })
+    -- It stays on the closer enemy (locked), it does not flip back every frame.
+    W.setRot = nil
+    W.tick(3)
+    assertAimedAt(W, { X = 1000, Y = 30, Z = 50 })
+end)
+
+test("aim: segmentHitsCapsule", function()
+    local up = { X = 0, Y = 0, Z = 1 }
+    local c = { X = 500, Y = 0, Z = 0 }
+    local s = Aim.segmentHitsCapsule({ X = 0, Y = 0, Z = 0 }, { X = 1000, Y = 0, Z = 0 }, c, up, 90, 40)
+    near(s, 0.5, 0.01)
+    eq(Aim.segmentHitsCapsule({ X = 0, Y = 60, Z = 0 }, { X = 1000, Y = 60, Z = 0 }, c, up, 90, 40), nil, "passes beside")
+    eq(Aim.segmentHitsCapsule({ X = 0, Y = 0, Z = 150 }, { X = 1000, Y = 0, Z = 150 }, c, up, 90, 40), nil, "passes over")
+    truthy(Aim.segmentHitsCapsule({ X = 0, Y = 0, Z = 80 }, { X = 1000, Y = 0, Z = 80 }, c, up, 90, 40), "clips the top")
+end)
+
+test("line of fire: enemy body in the way (traces pass through bodies in this game) -> closer enemy", function()
+    local W = makeWorld()
+    local back = W.enemy("B_Back_C", { X = 2000, Y = 10, Z = 0 }, { weakSpot = { X = 2000, Y = 10, Z = 40 } })
+    local front = W.enemy("B_Front_C", { X = 1000, Y = 15, Z = 0 }, { weakSpot = { X = 1000, Y = 15, Z = 50 } })
+    local function capsule(h, r)
+        return W.obj("CapsuleComponent", {}, { GetScaledCapsuleHalfHeight = function() return h end,
+            GetScaledCapsuleRadius = function() return r end })
+    end
+    back.CapsuleComponent = capsule(90, 40)
+    front.CapsuleComponent = capsule(90, 40)
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    truthy(W.status().aimTarget:find("^B_Front_C"), W.status().aimTarget)
+    truthy(W.status().aimTarget:find("in front of B_Back_C", 1, true), W.status().aimTarget)
+end)
+
+test("line of fire: weak spot covered -> an exposed head comes before an exposed hand", function()
+    local W = gearWorld(nil, { shield = true, onlyViaGoblin = true, noComponent = true })
+    -- Shield covers z -20..100 in front of the goblin; its head sticks out above, a hand to the side.
+    local bones = { { "spine_01", { X = 1000, Y = 0, Z = 40 } }, { "hand_r", { X = 1000, Y = 65, Z = 30 } },
+                    { "head", { X = 1000, Y = 0, Z = 140 } } }
+    W.goblin.Mesh = { IsValid = function() return true end,
+        DoesSocketExist = function() return false end,
+        GetNumBones = function() return #bones end,
+        GetBoneName = function(_, i) local n = bones[i + 1][1]; return { ToString = function() return n end } end,
+        GetSocketLocation = function(_, n) for _, b in ipairs(bones) do if b[1] == n.name then return b[2] end end end }
+    W.tick(6)
+    local st = W.status()
+    truthy(st.aimTarget:find("(head", 1, true), st.aimTarget)
+    assertAimedAt(W, { X = 1000, Y = 0, Z = 140 })
+end)
+
+test("line of fire: rock hides the weak spot -> exposed head bone before an exposed hand (closer to the weak spot)", function()
+    local W = makeWorld()
+    local e = W.enemy("B_RockHidden_C", { X = 1000, Y = 0, Z = 0 }, { weakSpot = { X = 1000, Y = 0, Z = 40 } })
+    local bones = { { "spine_01", { X = 1000, Y = 0, Z = 40 } }, { "hand_r", { X = 1000, Y = 65, Z = 30 } },
+                    { "head", { X = 1000, Y = 0, Z = 140 } } }
+    e.Mesh = { IsValid = function() return true end,
+        DoesSocketExist = function() return false end,
+        GetNumBones = function() return #bones end,
+        GetBoneName = function(_, i) local n = bones[i + 1][1]; return { ToString = function() return n end } end,
+        GetSocketLocation = function(_, n) for _, b in ipairs(bones) do if b[1] == n.name then return b[2] end end end }
+    local rock = W.obj("StaticMeshActor", { "Actor" }, {})
+    W.blockers = { { box = axisBox({ X = 900, Y = 0, Z = 25 }, { X = 20, Y = 40, Z = 75 }), owner = rock } }
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    local st = W.status()
+    truthy(st.aimTarget:find("head head+clear shot", 1, true), st.aimTarget .. " | " .. st.lineOfFire)
+    assertAimedAt(W, { X = 1000, Y = 0, Z = 140 })
+end)
+
+test("aim: rotAxes matches Unreal's rotation matrix", function()
+    local f, r, u = Aim.rotAxes(0, 90, 0)
+    near(f.X, 0, 1e-9); near(f.Y, 1, 1e-9); near(r.X, -1, 1e-9); near(u.Z, 1, 1e-9)
+    f = Aim.rotAxes(90, 0, 0)
+    near(f.Z, 1, 1e-9)
+    local yf, yr, yu = Aim.rotAxes(0, 90, 0)
+    local w = Aim.toWorld({ X = 10, Y = 0, Z = 0 }, yf, yr, yu, 5, 0, 0)
+    near(w.X, 10, 1e-9); near(w.Y, 5, 1e-9)
+end)
+
+test("line of fire: Troll Tamer's damage-proof mask covers the head -> aims at a body part it can hurt", function()
+    local W = makeWorld()
+    local tamer = W.enemy("B_C2_Troll_Tamer_C", { X = 1000, Y = 0, Z = 0 }, { weakSpot = { X = 1000, Y = 0, Z = 155 } })
+    local bones = { { "spine_01", { X = 1000, Y = 0, Z = 90 } }, { "Head", { X = 1000, Y = 0, Z = 155 } },
+                    { "Mask", { X = 900, Y = 0, Z = 150 } } }
+    tamer.Mesh = { IsValid = function() return true end,
+        DoesSocketExist = function() return false end,
+        GetNumBones = function() return #bones end,
+        GetBoneName = function(_, i) local n = bones[i + 1][1]; return { ToString = function() return n end } end,
+        GetSocketLocation = function(_, n) for _, b in ipairs(bones) do if b[1] == n.name then return b[2] end end end,
+        -- mask bone unrotated: the 97 cm board lies along X from x = 894 to 991, z = 140..160
+        GetSocketRotation = function() return { Pitch = 0, Yaw = 0, Roll = 0 } end }
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    local st = W.status()
+    truthy(st.lineOfFire:find("damage-proof", 1, true), st.lineOfFire)
+    truthy(st.aimTarget:find("clear shot", 1, true) and not st.aimTarget:find("weakspot"), st.aimTarget)
+    -- The aim line passes under the mask board (z 140..160 between x = 894 and 991).
+    local dx, dy, dz = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
+    truthy(dz / dx * 991 < 136, "below the mask")
+end)
+
+test("line of fire: nothing in the way -> the farther enemy near the crosshair is kept", function()
+    local W = makeWorld()
+    W.enemy("B_Back_C", { X = 2000, Y = 10, Z = 0 }, { weakSpot = { X = 2000, Y = 10, Z = 40 } })
+    W.enemy("B_Front_C", { X = 1000, Y = 300, Z = 0 }, { weakSpot = { X = 1000, Y = 300, Z = 50 } })
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    truthy(W.status().aimTarget:find("^B_Back_C"), W.status().aimTarget)
 end)
 
 test("line of fire: nothing in the way -> the weak spot is kept, even down low", function()
@@ -1250,6 +1493,63 @@ test("aim/main: soul-binding shaman is shot before the monsters it binds", funct
     truthy((readFile(W.dir .. SEP .. "enemies.txt") or ""):find("BIND B_C1_Goblin_Shaman_Elite_C protects B_C1_Troll_SpearMan_C"))
 end)
 
+test("aim/main: Troll Summoner's shield -> the summoner is shot first, only while the shield is up", function()
+    local W = makeWorld()
+    W.troll = W.enemy("B_C1_Troll_SpearMan_C", { X = 1000, Y = 0, Z = 0 })
+    W.summoner = W.enemy("B_C2_Troll_Summoner_C", { X = 800, Y = -500, Z = 0 }, { supers = { "EXASTrollSummoner" } })
+    W.registry["EXASTrollSummoner"] = { W.summoner }
+    -- The shield effect actor sits on the shielded troll.
+    W.fx = W.obj("B_ReplicatedVFX_Troll_Summoner_Shield_C", { "B_ReplicatedVFX_Troll_Summoner_Shield_C", "Actor" }, {
+        GetAttachParentActor = function() return W.troll end,
+        K2_GetActorLocation = function() return { X = 1000, Y = 0, Z = 50 } end })
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(7)
+    truthy(W.status().aimTarget:find("guard of B_C1_Troll_SpearMan_C"), W.status().aimTarget)
+    truthy(W.status().aimTarget:find("B_C2_Troll_Summoner_C"))
+    truthy((readFile(W.dir .. SEP .. "enemies.txt") or ""):find("SHIELD B_C2_Troll_Summoner_C protects B_C1_Troll_SpearMan_C"))
+    -- Shield gone: back to the troll.
+    W.registry["B_ReplicatedVFX_Troll_Summoner_Shield_C"] = nil
+    W.tick(6)
+    W.keysDown = {}; W.tick()
+    W.keysDown = { RightMouseButton = true }
+    W.setRot = nil
+    W.tick()
+    assertAimedAt(W, { X = 1000, Y = 0, Z = 70 })
+end)
+
+test("aim/main: summoner shield effect not attached -> the enemy standing in it is the protected one", function()
+    local W = makeWorld()
+    W.troll = W.enemy("B_C1_Troll_SpearMan_C", { X = 1000, Y = 0, Z = 0 })
+    W.summoner = W.enemy("B_C2_Troll_Summoner_C", { X = 800, Y = -500, Z = 0 }, { supers = { "EXASTrollSummoner" } })
+    W.registry["EXASTrollSummoner"] = { W.summoner }
+    W.obj("B_ReplicatedVFX_Troll_Summoner_Shield_C", { "B_ReplicatedVFX_Troll_Summoner_Shield_C", "Actor" }, {
+        K2_GetActorLocation = function() return { X = 1010, Y = 20, Z = 40 } end })
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(7)
+    truthy(W.status().aimTarget:find("B_C2_Troll_Summoner_C"), W.status().aimTarget)
+end)
+
+test("aim/main: Troll Hunter Elite hiding in a bush (immune) is skipped until it comes out", function()
+    local W = makeWorld()
+    local hunter = W.enemy("B_C2_Troll_Hunter_Elite_C", { X = 1000, Y = 0, Z = 0 })
+    W.enemy("B_C1_Goblin_C", { X = 1000, Y = 120, Z = 0 })
+    local ability = W.obj("GA_NPC_Troll_Hunter_Elite_BushAmbush_C", { "GA_NPC_Troll_Hunter_Elite_BushAmbush_C" },
+        { _outer = hunter, bAmbushDamageImmune = true })
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(7)
+    assertAimedAt(W, { X = 1000, Y = 120, Z = 70 })
+    ability.bAmbushDamageImmune = false
+    W.tick(6)
+    W.keysDown = {}; W.tick()
+    W.keysDown = { RightMouseButton = true }
+    W.setRot = nil
+    W.tick()
+    assertAimedAt(W, { X = 1000, Y = 0, Z = 70 })
+end)
+
 test("stats: fire rate cheat also speeds up bow draw", function()
     local W = makeWorld({ role = "host" })
     W.me.stats.ChargeSpeedRate = W.attr(1)
@@ -1498,6 +1798,7 @@ local function minimapWorld(settings, opts)
         local img = { IsValid = function(s) return not s.removed end, name = name and name.name, opacity = 1,
             GetFName = function(s) return { ToString = function() return s.name end } end,
             SetDesiredSizeOverride = function(s, v) s.size = v.X end,
+            SetBrushSize = function(s, v) s.brush = v.X end,
             SetRenderOpacity = function(s, v) s.opacity = v end,
             SetRenderTranslation = function(s, v) s.x, s.y = v.X, v.Y end,
             SetBrushFromTexture = function(s, t) s.tex = t.path end,
@@ -1555,7 +1856,7 @@ end
 test("minimap: own icons drawn for highlighted objects at the right spot, pinned to the edge when far", function()
     local W = minimapWorld("highlightChests=1\nminimapIcons=1\n")
     W.tick(8)
-    eq(#W.images, 24, "pool built once, even though every lookup returns a new handle")
+    eq(#W.images, 64, "pool built once (24 badges + 40 dots), even though every lookup returns a new handle")
     eq(W.images[1].halign, 2); eq(W.images[1].size, 27)
     local d = drawn(W)
     eq(#d, 2, "chest and secret room chest")
@@ -1583,7 +1884,7 @@ test("minimap: turning the option off hides the icons; the pool is not rebuilt",
     eq(#drawn(W), 0)
     writeFile(W.dir .. SEP .. "settings.ini", "highlightChests=1\nminimapIcons=1\n")
     W.tick(8)
-    eq(#drawn(W), 2); eq(#W.images, 24, "same pool")
+    eq(#drawn(W), 2); eq(#W.images, 64, "same pool")
 end)
 
 test("minimap: scale is measured from visible game icons only; hidden icons' stale positions are ignored", function()
@@ -1673,6 +1974,51 @@ test("highlights: a won grave (completed material) stays hidden even after its r
     current = W.obj("MaterialInstanceDynamic", {}, { Parent = pre })    -- even if it looked unfinished again
     W.tick(8)
     truthy(not W.status().highlighted:find("BP_DynamicEvent_Grave_C"), "stays hidden")
+end)
+
+test("minimap: magnet items as small dots (only within magnet range), under the badges", function()
+    local W = minimapWorld("minimapLootDots=1\nlootMagnetRadius=30\n")
+    local function pickup(cls, x, supers)
+        return W.obj(cls, { cls, "EXAutoCollectObject", "Actor" }, { _supers = supers,
+            K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
+    end
+    W.registry["EXAutoCollectObject"] = { pickup("B_Collectable_Gold_C", 1000), pickup("B_Collectable_Gold_C", 5000),
+        pickup("B_Exclusive_C", 500, { "EXExclusiveAutoCollectObject" }) }
+    W.tick(8)
+    local d = drawn(W)
+    eq(#d, 1, "the coin 10 m away; not the one 50 m away, not the per-player drop")
+    truthy(d[1].tex:find("loot_dot.png"), d[1].tex)
+    eq(d[1].size, 9); eq(d[1].brush, 9, "brush size too (the override alone left 32 px dots)"); near(d[1].x, 60, 1e-6)
+    truthy(W.status().minimapIcons:find("1 loot dots"), W.status().minimapIcons)
+    -- Dot slots were added to the overlay before the badge slots (badges draw on top).
+    truthy(W.images[1].name:find("_25$"), W.images[1].name)
+end)
+
+test("highlights: an artifact box I opened is dropped; one a teammate opened stays; other dungeons skipped", function()
+    local W = minimapWorld("highlightChests=1\nminimapIcons=1\n")
+    local function box(x, users, fullName, activated)
+        local mesh = W.obj("StaticMeshComponent", {}, { _primitive = true,
+            SetRenderCustomDepth = function() end, SetCustomDepthStencilValue = function() end })
+        return W.obj("B_LA_Artifact_Box_C", { "B_LA_Artifact_Box_C", "Actor" }, {
+            _supers = { "EXASArtifactBox", "Actor" }, _props = { "M" }, M = mesh, bActivated = activated,
+            -- UE4SS-style TArray of player states
+            UsedPlayer = { ForEach = function(_, fn) for i, u in ipairs(users) do fn(i, { get = function() return u end }) end end },
+            GetFullName = function() return fullName end,
+            K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
+    end
+    local here = "/Game/Maps/Dungeon/HiddenSubLevel_L_Dungeon_Battle_04_Design_Ch2.L_Dungeon_Battle_04_Design:PersistentLevel.B_LA_Artifact_Box_C"
+    local there = "/Game/Maps/Dungeon/HiddenSubLevel_L_Dungeon_Trap_04_Design_Ch2.L_Dungeon_Trap_04_Design:PersistentLevel.B_LA_Artifact_Box_C"
+    local mine = box(300, { W.me.ps }, here, true)
+    local mates = box(600, { W.mate.ps }, here, true)
+    local otherDungeon = box(900, {}, there, false)
+    W.registry["EXASArtifactBox"] = { mine, mates, otherDungeon }
+    W.tick(8)
+    local h = W.status().highlighted
+    local _, n = h:gsub("B_LA_Artifact_Box_C", "")
+    truthy(h:find("B_LA_Artifact_Box_C x1"), h)
+    local badges = 0
+    for _, img in ipairs(drawn(W)) do if img.tex:find("artifact_box.png") then badges = badges + 1; near(img.x, 0.06 * 600, 1e-6) end end
+    eq(badges, 1, "only the box a teammate opened")
 end)
 
 test("minimap: icons left by an earlier trainer version are removed", function()

@@ -198,4 +198,49 @@ function M.aimRotation(cam, point, ctrlRot, camRot, smoothing)
     return newPitch, newYaw
 end
 
+-- Unreal rotator (degrees) -> its X (forward), Y (right), Z (up) unit axes (FRotationMatrix).
+function M.rotAxes(pitch, yaw, roll)
+    local p, y, r = math.rad(pitch or 0), math.rad(yaw or 0), math.rad(roll or 0)
+    local sp, cp, sy, cy, sr, cr = math.sin(p), math.cos(p), math.sin(y), math.cos(y), math.sin(r), math.cos(r)
+    return { X = cp * cy, Y = cp * sy, Z = sp },
+           { X = sr * sp * cy - cr * sy, Y = sr * sp * sy + cr * cy, Z = -sr * cp },
+           { X = -(cr * sp * cy + sr * sy), Y = cy * sr - cr * sp * sy, Z = cr * cp }
+end
+
+-- A local vector (x, y, z along axes f, r, u) in world space.
+function M.toWorld(origin, f, r, u, x, y, z)
+    return { X = origin.X + f.X * x + r.X * y + u.X * z,
+             Y = origin.Y + f.Y * x + r.Y * y + u.Y * z,
+             Z = origin.Z + f.Z * x + r.Z * y + u.Z * z }
+end
+
+-- Does the segment a->b pass through a capsule (center, unit up axis, half height, radius)?
+-- Returns the fraction along a->b (0..1) of the closest approach, or nil when it misses.
+function M.segmentHitsCapsule(a, b, center, up, halfHeight, radius)
+    local h = math.max(0, halfHeight - radius)
+    local p1 = { X = center.X - up.X * h, Y = center.Y - up.Y * h, Z = center.Z - up.Z * h }
+    local q1 = { X = center.X + up.X * h, Y = center.Y + up.Y * h, Z = center.Z + up.Z * h }
+    -- Closest points between segments a->b and p1->q1 (Ericson, Real-Time Collision Detection 5.1.9).
+    local d1, d2, r = sub(b, a), sub(q1, p1), sub(a, p1)
+    local A, E, F = dot(d1, d1), dot(d2, d2), dot(d2, r)
+    local s, t
+    if A <= 1e-9 then return nil end
+    local C = dot(d1, r)
+    if E <= 1e-9 then
+        s, t = math.max(0, math.min(1, -C / A)), 0
+    else
+        local B = dot(d1, d2)
+        local denom = A * E - B * B
+        s = denom ~= 0 and math.max(0, math.min(1, (B * F - C * E) / denom)) or 0
+        t = (B * s + F) / E
+        if t < 0 then t, s = 0, math.max(0, math.min(1, -C / A))
+        elseif t > 1 then t, s = 1, math.max(0, math.min(1, (B - C) / A)) end
+    end
+    local c1 = { X = a.X + d1.X * s, Y = a.Y + d1.Y * s, Z = a.Z + d1.Z * s }
+    local c2 = { X = p1.X + d2.X * t, Y = p1.Y + d2.Y * t, Z = p1.Z + d2.Z * t }
+    local d = sub(c1, c2)
+    if dot(d, d) <= radius * radius then return s end
+    return nil
+end
+
 return M
