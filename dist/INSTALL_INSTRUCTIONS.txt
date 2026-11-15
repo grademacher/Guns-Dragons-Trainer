@@ -39,8 +39,7 @@ INSTALL
    You should see EXGameSteam-Win64-Shipping.exe in there. This is the target folder.
 
 4. Copy EVERYTHING from the zip's "Win64" folder into that Win64 folder
-   (dwmapi.dll and the ue4ss folder). If Windows asks, choose "Replace the files".
-   When you're done, the folder contains:
+   (dwmapi.dll and the ue4ss folder). When you're done, the folder contains:
        EXGameSteam-Win64-Shipping.exe
        dwmapi.dll
        ue4ss\...
@@ -50,12 +49,6 @@ INSTALL
    - Its top line says "Connected to game" once the trainer is running.
    - All cheats start switched OFF. Turn on what you want in the window. Settings are saved
      automatically and remembered next time.
-
-If you already use UE4SS with other mods: don't overwrite your ue4ss\Mods\mods.txt. Instead add this
-line to it, above the "Keybinds : 1" line:
-    GunsDragonsTrainer : 1
-and copy only these files from the zip: ue4ss\Mods\GunsDragonsTrainer\ (the whole folder) and
-ue4ss\MemberVariableLayout.ini. MemberVariableLayout.ini is still needed.
 
 
 THE TRAINER WINDOW
@@ -128,8 +121,7 @@ RELOADING WITHOUT RESTARTING THE GAME
 
 UNINSTALL
 ---------
-Delete dwmapi.dll and the ue4ss folder from ...\EX\Binaries\Win64. To keep UE4SS but remove only the
-trainer, delete ue4ss\Mods\GunsDragonsTrainer and its line in ue4ss\Mods\mods.txt.
+Delete dwmapi.dll and the ue4ss folder from ...\EX\Binaries\Win64.
 
 
 TROUBLESHOOTING
