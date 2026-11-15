@@ -1,4 +1,4 @@
-GUNS & DRAGONS TRAINER v3.5.2 - INSTALL INSTRUCTIONS
+GUNS & DRAGONS TRAINER v3.5.5 - INSTALL INSTRUCTIONS
 =====================================================
 
 A trainer for the Guns and Dragons Playtest (Steam), built as a UE4SS mod with an on-screen
@@ -95,7 +95,7 @@ Aim assist (default: hold Right Mouse)
     invulnerable.
   - Prefers explosive gear (barrels, grenades) when it faces you.
   - Aims over held shields.
-  - Ignores mushrooms while they are ducked (they block damage then).
+  - Shoots the glowing hat on top of ducked mushrooms (their body blocks damage then).
   - Leads moving targets and compensates for bullet drop.
   - "Aim assist targets supplies": also shoots the flying clay supplies, one shot each, then the next
     clay.

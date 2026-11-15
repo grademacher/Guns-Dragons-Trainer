@@ -70,17 +70,37 @@ return {
         ignoreShieldClasses = { "EXASSphereShield" },
         -- Only shields this close to the target (cm) are checked.
         shieldSearchRadius = 600,
+        -- Part classes to look for. Blueprint subclasses are listed too: FindAllOf on the native parent alone
+        -- missed the goblins' shields (B_GoblinShield_C) in a real fight.
+        classes = { "EXDamageableParts", "EXASDamageableParts", "B_DamageableParts_C", "B_GoblinShield_C",
+                    "B_Goblin_Spiked_Shield_C",
+                    "B_Monster_GoblinGrenadier_C", "B_GoblinBarrel_C" },
+        shieldPatterns = { "shield" },
+        -- Shield goblins carry their shield as a child actor component named B_GoblinShield
+        -- (B_C1_Goblin_Soldier_C: B_GoblinShield_C; B_C2_Goblin_Spiked_Shield_C: B_Goblin_Spiked_Shield_C).
+        -- Only the spiked one also has a ShieldComponent (bShieldBroken once broken).
+        shieldComponentProp = "ShieldComponent",
+        shieldActorProps = { "Shield", "B_GoblinShield" },
+        -- Clearance kept around a shield (cm), and the rough height of your gun above your character's center.
+        shieldMargin = 12,
+        gunHeight = 40,
         -- Explosive part this close to the enemy's vertical axis (cm) counts as visible from anywhere.
         explosiveCenterRadius = 15,
         -- How far above the aim point to look for a clear line over a shield (cm), and the step.
-        overShieldMax = 150,
+        overShieldMax = 60,      -- any higher and the shot flies over the enemy's head too
         overShieldStep = 10,
     },
 
     -- Loot chests outlined by "Highlight loot chests" (opened ones are skipped).
     -- EXASMaterialTreasureChest: resource chest. EXASArtifactBox: artifact box (B_LA_Artifact_Box_C).
     -- EXASSuddenEventReward: secret room / event reward chest (B_SecretRoomReward_C).
-    chests = { classes = { "EXASMaterialTreasureChest", "EXASArtifactBox", "EXASSuddenEventReward" } },
+    -- Also dynamic events (graves you stand next to to trigger a wave that drops a reward); the blueprint
+    -- class is listed too because FindAllOf on a native parent can miss blueprint children.
+    chests = { classes = { "EXASMaterialTreasureChest", "EXASArtifactBox", "EXASSuddenEventReward",
+                           "EXASDynamicEventPoint", "BP_DynamicEvent_Grave_C" },
+               eventClass = "EXASDynamicEventPoint",
+               -- The reward chest (B_SuddenEventReward_Level_01_C) appears within this distance (cm) of its event.
+               rewardClasses = { "EXASSuddenEventReward", "B_SuddenEventReward_C" }, eventRewardRadius = 800 },
 
     -- Experimental "Show highlights on minimap": the trainer draws its own icons (icons\*.png next to the mod,
     -- made by icons\make_icons.ps1) on the game's minimap for highlighted objects, including ones the game has
@@ -89,6 +109,7 @@ return {
         icons = {
             { parent = "EXASSuddenEventReward", icon = "secret_chest.png" },     -- secret room / event reward chests
             { parent = "EXASMaterialTreasureChest", icon = "chest.png" },        -- resource chests
+            { parent = "EXASDynamicEventPoint", icon = "event_grave.png" },     -- dynamic events (graves)
             { parent = "EXASArtifactBox", icon = "artifact_box.png" },
             { parent = "B_MaterialGimmick_Base_C", icon = "clay_launcher.png" }, -- bone / tomb / barrel piles
             { parent = "B_SecretBreakableWall_C", icon = "secret_wall.png" },
@@ -98,6 +119,9 @@ return {
         namePrefix = "GDT_MinimapIcon_",
         iconWidgetClass = "W_MinimapIcon_C", -- the game's icons, used to measure the map scale
         defaultScale = 0.06,     -- px per cm (measured 2026-11-15); re-measured live from the game's icons
+        scaleRange = { 0.5, 2 }, -- live measurements outside defaultScale x this range are ignored
+        mergeDistance = 450,     -- cm; objects with the same icon closer than this share one badge (~27 px)
+        maxHeightDiff = 20000,   -- cm; objects further above/below you are in another area and get no badge
         defaultEdge = 184,       -- px from center where icons are pinned to the edge
         calibrateSeconds = 2,
     },
@@ -107,7 +131,9 @@ return {
 
     -- Mushroom enemies (spore colony) duck into the ground and block damage. Their EXASSporeColonyComponent
     -- (property SporeColony / GetSporeColony()) has these flags while ducked.
-    burrow = { componentProp = "SporeColony", flags = { "bIsBurrowed", "bIsBurrowing" } },
+    -- While ducked only the hat on top (bones ElphaHat01..; HatBonePrefix on the component) takes damage, until
+    -- it breaks (bHatDestroyed) and stuns the mushroom.
+    burrow = { componentProp = "SporeColony", flags = { "bIsBurrowed", "bIsBurrowing" }, hatBonePrefix = "ElphaHat" },
 
     -- Lifeline guards: a small imp tethered to an enemy keeps it invulnerable until the imp dies.
     -- The tether is an EXASLifeLineLinkActor with SourceNPC / TargetNPC; the end whose class name
@@ -135,6 +161,15 @@ return {
         fallbackTickMs = 8,          -- only used if per-frame game-thread loops aren't available
         -- Classes never targeted (friendly summons). Team checks catch the rest.
         ignoreClasses = { "EXASThornBloom" },
+        -- Line of fire (with "line of sight" on): the aim point must be reachable from the camera and the gun
+        -- without hitting terrain, walls or a shield; otherwise another point on the enemy is used.
+        lineOfFire = {
+            traceChannel = 0,       -- TraceTypeQuery1 = Visibility
+            pointTolerance = 25,    -- cm; a hit this close to the aim point counts as reaching it
+            maxBones = 24,          -- bones tried at most per enemy type
+            skipBones = { "ik_", "root", "attach", "weapon", "socket", "prop", "camera", "_end", "twist", "pole" },
+            stickySeconds = 0.3,    -- prefer the last clear point for this long (no flicker)
+        },
         -- Keep a locked target this long after it goes out of sight (e.g. behind its own shield).
         stickySeconds = 1.5,
         -- Extra radius (degrees) a locked target may drift outside the aim radius before it is dropped.

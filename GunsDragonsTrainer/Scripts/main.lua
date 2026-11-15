@@ -15,7 +15,7 @@ local cfg = require("config")
 local Settings = require("gdt_settings")
 local Aim = require("gdt_aim")
 
-local VERSION = "3.5.2"
+local VERSION = "3.7.0"
 local TAG = "[G&D Trainer] "
 
 local function log(fmt, ...)
@@ -815,11 +815,19 @@ local function calibrateMinimap(pawnLoc)
             if type(edge) == "number" and edge > 20 then mm.edge = edge end
             local ol = valid(own) and try(function() return own:K2_GetActorLocation() end)
             local tr = try(function() local t = iw.RenderTransform.Translation; return { X = t.X, Y = t.Y } end)
-            if isVec(ol) and tr and type(tr.X) == "number" then
+            -- Hidden icons (dead enemies, unexplored rooms) keep a stale position: measuring them pulled the scale
+            -- down to ~0.014 and left our icons huddled around the player (2026-11-15). Only visible icons count,
+            -- and only ratios near the measured default.
+            local shown = try(function() return iw:IsVisible() end) == true
+            if shown and isVec(ol) and tr and type(tr.X) == "number" then
                 local dx, dy = ol.X - pawnLoc.X, ol.Y - pawnLoc.Y
                 local d = math.sqrt(dx * dx + dy * dy)
                 local t = math.sqrt(tr.X * tr.X + tr.Y * tr.Y)
-                if d > 300 and t > 3 and t < mm.edge * 0.9 then ratios[#ratios + 1] = t / d end
+                local ratio = d > 0 and t / d or 0
+                if d > 300 and t > 3 and t < mm.edge * 0.9
+                    and ratio > MM.defaultScale * MM.scaleRange[1] and ratio < MM.defaultScale * MM.scaleRange[2] then
+                    ratios[#ratios + 1] = ratio
+                end
             end
         end
         ::continue::
@@ -855,15 +863,27 @@ local function minimapFrame(pc)
     local th = math.rad(-(yaw + 90))
     local c, s = math.cos(th), math.sin(th)
     -- Nearest objects first.
-    local items = {}
+    local all = {}
     for _, e in ipairs(mm.drawList) do
         local l = valid(e.actor) and try(function() return e.actor:K2_GetActorLocation() end)
-        if isVec(l) then
+        -- Levels place a secret wall and chest for every possible secret room and park the unused ones at the
+        -- world origin; objects far above or below you are in another area (hidden dungeon sublevels).
+        if isVec(l) and not (l.X == 0 and l.Y == 0 and l.Z == 0) and math.abs(l.Z - here.Z) <= MM.maxHeightDiff then
             local dx, dy = l.X - here.X, l.Y - here.Y
-            items[#items + 1] = { dx = dx, dy = dy, d2 = dx * dx + dy * dy, icon = e.icon }
+            all[#all + 1] = { dx = dx, dy = dy, d2 = dx * dx + dy * dy, icon = e.icon }
         end
     end
-    table.sort(items, function(a, b) return a.d2 < b.d2 end)
+    table.sort(all, function(a, b) return a.d2 < b.d2 end)
+    -- One badge per spot: a secret wall is often two wall pieces side by side.
+    local items = {}
+    for _, it in ipairs(all) do
+        local dup = false
+        for _, k in ipairs(items) do
+            local ex, ey = it.dx - k.dx, it.dy - k.dy
+            if k.icon == it.icon and ex * ex + ey * ey < MM.mergeDistance * MM.mergeDistance then dup = true; break end
+        end
+        if not dup then items[#items + 1] = it end
+    end
     for i, p in ipairs(mm.pool) do
         local it = items[i]
         if it and valid(p.img) then
@@ -901,6 +921,8 @@ local function syncIcons()
     mm.drawList = list
 end
 
+local finishedEvents = {} -- dynamic event address -> true once won (stays hidden after its chest is gone)
+
 local function highlightTick()
     local want = {}
     local function addAll(classes, skip)
@@ -918,8 +940,40 @@ local function highlightTick()
     end
     if S.highlightSecretWalls then addAll(cfg.secretWalls.classes) end
     if S.highlightChests then
+        -- A finished dynamic event (grave) turns into a reward chest on the spot; the grave is done then.
+        local rewards = {}
+        for _, cls in ipairs(cfg.chests.rewardClasses) do
+            for _, r in ipairs(FindAllOf(cls) or {}) do
+                local l = valid(r) and try(function() return r:K2_GetActorLocation() end)
+                if isVec(l) then rewards[#rewards + 1] = l end
+            end
+        end
+        local function eventDone(o)
+            if not chainHas(o, { [cfg.chests.eventClass] = true }) then return false end
+            local a = addr(o)
+            if finishedEvents[a] then return true end
+            local done = false
+            -- The grave's mesh switches to its CompletedMaterial when the event is won.
+            local mesh = try(function() return o.VisualMesh end)
+            local want = addr(try(function() return o.CompletedMaterial end))
+            local mat = valid(mesh) and try(function() return mesh:GetMaterial(0) end)
+            if want and valid(mat) then
+                local parent = try(function() return mat.Parent end)
+                done = addr(mat) == want or (valid(parent) and addr(parent) == want)
+            end
+            -- Or its reward chest has appeared next to it.
+            local l = try(function() return o:K2_GetActorLocation() end)
+            if not done and isVec(l) then
+                for _, r in ipairs(rewards) do
+                    if near(r, l, cfg.chests.eventRewardRadius) then done = true; break end
+                end
+            end
+            if done and a then finishedEvents[a] = true end
+            return done
+        end
         addAll(cfg.chests.classes, function(o)
             return try(function() return o.bOpened end) == true or try(function() return o.bDisappearing end) == true
+                or eventDone(o)
         end)
     end
     local keep = {}
@@ -1078,6 +1132,7 @@ local function partOwner(p)
 end
 
 local shapeCache = {} -- shield address -> { comp, min, max } | false
+local gunOrigin = nil  -- this frame's rough muzzle position (set by aimTick)
 
 local function readOut(fn)
     local a, b = {}, {}
@@ -1132,17 +1187,65 @@ local function logPartClass(p, owner, kind)
         box and string.format("(%.0fx%.0fx%.0f)", box.max.X - box.min.X, box.max.Y - box.min.Y, box.max.Z - box.min.Z) or "-"))
 end
 
+-- Every part actor, from all listed classes (FindAllOf on the native parent alone missed the goblins' shields).
+local function allParts()
+    local seen, out = {}, {}
+    for _, cls in ipairs(PARTS.classes) do
+        for _, p in ipairs(FindAllOf(cls) or {}) do
+            local a = valid(p) and addr(p)
+            if a and not seen[a] then seen[a] = true; out[#out + 1] = p end
+        end
+    end
+    return out, seen
+end
+
+-- The shield an enemy carries, read from the enemy itself (ShieldComponent / its shield child actor).
+-- nil when it has none or the shield is broken.
+local function carriedShield(enemy)
+    -- Only the spiked-shield goblin has a ShieldComponent; the plain shield goblin (B_C1_Goblin_Soldier_C) just
+    -- carries the B_GoblinShield child actor (v3.5.5 required the component and found no shields at all).
+    local comp = try(function() return enemy[PARTS.shieldComponentProp] end)
+    if not valid(comp) then comp = nil end
+    if comp and try(function() return comp.bShieldBroken end) == true then return nil end
+    for _, prop in ipairs(PARTS.shieldActorProps) do
+        local v = comp and try(function() return comp[prop] end)
+        if not valid(v) then v = try(function() return enemy[prop] end) end
+        if valid(v) then
+            -- A ChildActorComponent holds the actor in its ChildActor field. (GetChildActor() is not callable
+            -- from Lua on this build: v3.5.11 found 5 shield goblins and 0 shields that way.)
+            local child = try(function() return v.ChildActor end)
+            if not valid(child) then child = try(function() return v:GetChildActor() end) end
+            if valid(child) then return child end
+            if try(function() return v:K2_GetActorLocation() end) then return v end
+        end
+    end
+    return nil
+end
+
+local shieldInfo = ""
 local function refreshParts()
     local sh, ex, owners = {}, {}, {}
-    for _, p in ipairs(FindAllOf("EXDamageableParts") or {}) do
-        if valid(p) and try(function() return p.bHidden end) ~= true and try(function() return p.bDestroy end) ~= true then
+    local parts, seen = allParts()
+    local bearers, holding = 0, 0
+    for _, e in ipairs(enemies) do
+        if valid(e) and valid(try(function() return e[PARTS.shieldActorProps[2]] end)) then bearers = bearers + 1 end
+        local s = valid(e) and carriedShield(e)
+        if s then holding = holding + 1 end
+        local a = s and addr(s)
+        if a and not seen[a] then seen[a] = true; parts[#parts + 1] = s end
+        if a then owners[addr(e)] = true end
+    end
+    for _, p in ipairs(parts) do
+        -- Not bDestroy: that's a "destroy this part when it breaks" setting, true on every intact goblin shield
+        -- (filtering on it dropped all shields until v3.5.14). A broken part is destroyed, so valid() covers it.
+        if valid(p) and try(function() return p.bHidden end) ~= true then
             local owner = partOwner(p)
             local oa = owner and addr(owner)
             local kind = "other"
             if matchesPattern(p, PARTS.explosivePatterns) then
                 kind = "explosive"
                 if oa then ex[oa] = ex[oa] or {}; table.insert(ex[oa], p) end
-            elseif try(function() return p.bIsBlock end) == true then
+            elseif try(function() return p.bIsBlock end) == true or matchesPattern(p, PARTS.shieldPatterns) then
                 kind = "shield"
                 sh[#sh + 1] = p
                 if oa then owners[oa] = true end
@@ -1159,6 +1262,7 @@ local function refreshParts()
         end
     end
     shields, explosivesByOwner, shieldOwners = sh, ex, owners
+    shieldInfo = string.format("shield goblins %d, still holding a shield %d", bearers, holding)
 end
 
 -- Lifeline guards: protected enemy address -> guard actor (alive guards only).
@@ -1221,14 +1325,18 @@ local function refreshGuards()
     guardOf = map
 end
 
--- Is the line from the camera to `point` blocked by any shield near the target?
-local function blockedByShield(cam, point, targetLoc)
+-- Is the line from the camera (or the gun) to `point` blocked by any shield near the target?
+local function blockedByShield(cam, point, targetLoc, gun)
     for _, s in ipairs(shields) do
         if valid(s) then
             local sl = try(function() return s:K2_GetActorLocation() end)
             if isVec(sl) and near(sl, targetLoc, PARTS.shieldSearchRadius) then
                 local box = shieldBox(s)
-                if box and Aim.segmentHitsBox(cam, point, box, 3) then return true end
+                -- Checked from the camera and from the gun (bullets leave the muzzle, below the camera line).
+                if box and (Aim.segmentHitsBox(cam, point, box, PARTS.shieldMargin)
+                    or (gun and Aim.segmentHitsBox(gun, point, box, PARTS.shieldMargin))) then
+                    return true
+                end
             end
         end
     end
@@ -1252,7 +1360,7 @@ local function aimPoints(pawn, actorLoc, cam)
     local pts = {}
     if S.aimExplosives and cam then
         for _, p in ipairs(explosivesByOwner[addr(pawn)] or {}) do
-            if valid(p) and try(function() return p.bDestroy end) ~= true then
+            if valid(p) then
                 local e = partCenter(p)
                 if e and near(e, actorLoc, 1500) and Aim.facesCamera(e, actorLoc, cam, PARTS.explosiveCenterRadius) then
                     pts[#pts + 1] = { point = e, kind = "explosive" }
@@ -1290,7 +1398,7 @@ local function aimPoints(pawn, actorLoc, cam)
     if sanePoint(a, actorLoc) then pts[#pts + 1] = { point = vec(a), kind = "auto" } end
     local k = half * cfg.aim.headHeightFraction
     pts[#pts + 1] = { point = { X = actorLoc.X + up.X * k, Y = actorLoc.Y + up.Y * k, Z = actorLoc.Z + up.Z * k }, kind = "capsule" }
-    return pts
+    return pts, { half = half, radius = radius, up = up, mesh = mesh }
 end
 
 -- Picks the aim point. With shields around, the first point the camera can see past them wins; if a shield
@@ -1299,7 +1407,7 @@ local function aimPoint(pawn, actorLoc, cam)
     local pts = aimPoints(pawn, actorLoc, cam)
     if not (cam and S.aimOverShields and #shields > 0) then return pts[1].point, pts[1].kind end
     for _, p in ipairs(pts) do
-        if not blockedByShield(cam, p.point, actorLoc) then return p.point, p.kind end
+        if not blockedByShield(cam, p.point, actorLoc, gunOrigin) then return p.point, p.kind end
     end
     local base = pts[#pts]
     for _, p in ipairs(pts) do
@@ -1308,10 +1416,149 @@ local function aimPoint(pawn, actorLoc, cam)
     local up = upVector(pawn)
     for h = PARTS.overShieldStep, PARTS.overShieldMax, PARTS.overShieldStep do
         local q = { X = base.point.X + up.X * h, Y = base.point.Y + up.Y * h, Z = base.point.Z + up.Z * h }
-        if not blockedByShield(cam, q, actorLoc) then return q, base.kind .. "+over shield" end
+        if not blockedByShield(cam, q, actorLoc, gunOrigin) then return q, base.kind .. "+over shield" end
     end
     return pts[1].point, pts[1].kind
 end
+
+---------------------------------------------------------------------------
+-- Line of fire: is anything (terrain, walls, a shield) between the gun and the aim point? Uses the engine's
+-- own line trace (KismetSystemLibrary.LineTraceSingle, tested from Lua on this build 2026-11-15).
+---------------------------------------------------------------------------
+
+local lineOfFirePoint -- defined in the block below (kept in its own scope: Lua allows 200 locals per chunk)
+do
+local LOF = cfg.aim.lineOfFire
+local traceColor = { R = 0, G = 0, B = 0, A = 0 }
+status.lineOfFire = ""
+
+-- The actor a trace hit, or nil.
+local function hitActor(hit)
+    local c = hit.Component
+    local o = c ~= nil and try(function() return c:GetOwner() end)
+    if not valid(o) then o = c ~= nil and try(function() return c:Get():GetOwner() end) end
+    if valid(o) then return o end
+    local h = hit.HitObjectHandle
+    local a = type(h) == "table" and h.Actor
+    if valid(a) then return a end
+    return nil
+end
+
+-- true when a shot from `from` reaches `point` (or the target's own body) before hitting anything else.
+-- Second result: the class of what is in the way.
+local function lineClear(me, from, point, targetAddr)
+    local lib = kismetSystem()
+    if not (valid(lib) and valid(me)) then return true end
+    local hit = {}
+    -- WorldContext = my pawn with bIgnoreSelf, so my own character never blocks.
+    local ok, ret = pcall(function()
+        return lib:LineTraceSingle(me, from, point, LOF.traceChannel, false, {}, 0, hit, true, traceColor, traceColor, 0)
+    end)
+    if not ok or ret ~= true or hit.bBlockingHit ~= true then return true end
+    if isVec(hit.Location) and near(hit.Location, point, LOF.pointTolerance) then return true end
+    local o = hitActor(hit)
+    if o and targetAddr and addr(o) == targetAddr then return true end
+    return false, o and className(o) or "terrain"
+end
+
+-- Bones to try when the usual aim points are covered (thinned out, no IK/root/weapon helper bones).
+local boneCache = {} -- class name -> list of bone names
+local function boneNames(pawn, mesh)
+    local cls = className(pawn)
+    local names = boneCache[cls]
+    if names then return names end
+    local all = {}
+    local n = try(function() return mesh:GetNumBones() end)
+    if type(n) == "number" then
+        for i = 0, math.min(n, 300) - 1 do
+            local nm = try(function() return mesh:GetBoneName(i) end)
+            local str = nm and try(function() return nm:ToString() end)
+            if str and str ~= "None" then
+                local l = str:lower()
+                local skip = false
+                for _, pat in ipairs(LOF.skipBones) do
+                    if l:find(pat, 1, true) then skip = true; break end
+                end
+                if not skip then all[#all + 1] = str end
+            end
+        end
+    end
+    names = {}
+    local step = math.max(1, #all / LOF.maxBones)
+    local i = 1
+    while i <= #all do
+        names[#names + 1] = all[math.floor(i)]
+        i = i + step
+    end
+    if #names > 0 then boneCache[cls] = names end -- an empty read (mesh not ready) is retried next time
+    return names
+end
+
+local lofCache = {} -- target address -> { at = time, kind = chosen kind }
+
+-- Picks a point on the target that a shot can actually reach. Keeps the planned point when it is clear;
+-- otherwise tries, in order: the other aim points (weak spot, head, auto-aim point, upper body), the
+-- enemy's bones nearest the weak spot, and finally the plan (over the shield, or into the cover).
+function lineOfFirePoint(pc, pawn, actorLoc, cam, planned, plannedKind, alt)
+    local me = localPawn(pc)
+    local ta = addr(pawn)
+    local function clear(p)
+        if S.aimOverShields and #shields > 0 and blockedByShield(cam, p, actorLoc, gunOrigin) then
+            return false, "shield"
+        end
+        local ok, what = lineClear(me, cam, p, ta)
+        if not ok then return false, what end
+        if gunOrigin then
+            ok, what = lineClear(me, gunOrigin, p, ta)
+            if not ok then return false, what end
+        end
+        return true
+    end
+    -- A point raised over a shield may pass over the enemy's head as well: only a last resort.
+    local raised = plannedKind and plannedKind:find("over shield", 1, true)
+    local blockedBy = "shield"
+    if not raised then
+        local ok, what = clear(planned)
+        if ok then lofCache[ta] = nil; return planned, plannedKind end
+        blockedBy = what
+        status.lineOfFire = string.format("%s blocked by %s", plannedKind or "?", what or "?")
+    end
+    local pts, info
+    if alt then pts, info = alt, {} else pts, info = aimPoints(pawn, actorLoc, cam) end
+    local cands = {}
+    for _, p in ipairs(pts) do cands[#cands + 1] = p end
+    if not alt and valid(info.mesh) then
+        local ref = pts[1] and pts[1].point or actorLoc
+        local bones = {}
+        for _, b in ipairs(boneNames(pawn, info.mesh)) do
+            local v = try(function() return info.mesh:GetSocketLocation(fname(b)) end)
+            if isVec(v) and Aim.nearBody(vec(v), actorLoc, info.up, info.half, info.radius) then
+                local d = math.sqrt((v.X - ref.X) ^ 2 + (v.Y - ref.Y) ^ 2 + (v.Z - ref.Z) ^ 2)
+                bones[#bones + 1] = { point = vec(v), kind = "body " .. b, d = d }
+            end
+        end
+        table.sort(bones, function(a, b) return a.d < b.d end)
+        for _, b in ipairs(bones) do cands[#cands + 1] = b end
+    end
+    -- The point chosen a moment ago first, so the aim does not flicker between equally good points.
+    local c = lofCache[ta]
+    if c and now() - c.at < LOF.stickySeconds then
+        for i, p in ipairs(cands) do
+            if p.kind == c.kind then table.remove(cands, i); table.insert(cands, 1, p); break end
+        end
+    end
+    for _, p in ipairs(cands) do
+        if (raised or p.kind ~= plannedKind) and clear(p.point) then
+            lofCache[ta] = { at = now(), kind = p.kind }
+            status.lineOfFire = string.format("%s (%s blocked by %s)", p.kind, plannedKind or "?", blockedBy or "?")
+            return p.point, p.kind .. "+clear shot"
+        end
+    end
+    lofCache[ta] = nil
+    -- Nothing reachable: keep the plan (over the shield, or into the cover / shield to break it).
+    return planned, plannedKind
+end
+end -- line of fire block
 
 local function isAlive(pawn)
     if try(function() return pawn.IsDead end) == true then return false end
@@ -1342,6 +1589,46 @@ local function isBurrowed(pawn)
         if try(function() return comp[f] end) == true then return true end
     end
     return false
+end
+
+-- Ducked mushrooms: their glowing hat (bones ElphaHat01, 02, ...) still takes damage; breaking it stuns the
+-- mushroom (groggy). Returns the hat's bone positions, top first, or nil when the hat is already broken.
+local hatPoints
+do
+    local hatBones = {} -- class name -> list of hat bone names
+    function hatPoints(pawn)
+        local comp = try(function() return pawn:GetSporeColony() end)
+        if not valid(comp) then comp = try(function() return pawn[cfg.burrow.componentProp] end) end
+        if not valid(comp) or try(function() return comp.bHatDestroyed end) == true then return nil end
+        local mesh = try(function() return pawn.Mesh end)
+        if not valid(mesh) then return nil end
+        local cls = className(pawn)
+        local names = hatBones[cls]
+        if not names then
+            local prefix = try(function() return comp.HatBonePrefix:ToString() end)
+            if type(prefix) ~= "string" or prefix == "" then prefix = cfg.burrow.hatBonePrefix end
+            local root = try(function() return comp.HatRootBoneName:ToString() end)
+            names = {}
+            local n = try(function() return mesh:GetNumBones() end)
+            if type(n) == "number" then
+                for i = 0, math.min(n, 300) - 1 do
+                    local nm = try(function() return mesh:GetBoneName(i) end)
+                    local str = nm and try(function() return nm:ToString() end)
+                    if str and str:sub(1, #prefix) == prefix then names[#names + 1] = str end
+                end
+            end
+            if #names == 0 and type(root) == "string" and root ~= "" and root ~= "None" then names = { root } end
+            if #names > 0 then hatBones[cls] = names end
+        end
+        local pts = {}
+        for _, b in ipairs(names) do
+            local v = try(function() return mesh:GetSocketLocation(fname(b)) end)
+            if isVec(v) then pts[#pts + 1] = { point = vec(v), kind = "hat " .. b } end
+        end
+        if #pts == 0 then return nil end
+        table.sort(pts, function(a, b) return a.point.Z > b.point.Z end)
+        return pts
+    end
 end
 
 -- One line per enemy class seen, so aim points can be checked after a session (enemies.txt).
@@ -1533,6 +1820,11 @@ local function aimTick(pc)
     local cam = vec(camLoc)
     local camR = { Pitch = camRot.Pitch, Yaw = camRot.Yaw }
     local maxDist = S.aimMaxDistance * 100
+    -- Rough muzzle position: bullets start at the gun, below the camera line, so a shot that clears a shield
+    -- for the camera can still hit it.
+    local me = localPawn(pc)
+    local ml = me and try(function() return me:K2_GetActorLocation() end)
+    gunOrigin = isVec(ml) and { X = ml.X, Y = ml.Y, Z = ml.Z + PARTS.gunHeight } or nil
 
     -- Cheap first pass on actor locations with a wider cone, then exact aim points for the survivors.
     local wideFov = math.min(89, S.aimFov + math.max(20, cfg.aim.stickyExtraFov))
@@ -1545,12 +1837,22 @@ local function aimTick(pc)
         if not isVec(loc) then return end
         local dx, dy, dz = loc.X - cam.X, loc.Y - cam.Y, loc.Z - cam.Z
         local d = math.sqrt(dx * dx + dy * dy + dz * dz)
-        if d > 1 and d <= maxDist + 500 and (dx * fx + dy * fy + dz * fz) / d >= cosWide then
+        -- Clays are taken from any direction (no field-of-view cone); enemies only inside the cone.
+        if d > 1 and d <= maxDist + 500 and (isSupply or (dx * fx + dy * fy + dz * fz) / d >= cosWide) then
             if isSupply then
                 candidates[#candidates + 1] = { actor = actor, point = vec(loc), kind = "supply", key = addr(actor) }
-            elseif isAlive(actor) and not (S.aimSkipBurrowed and isBurrowed(actor)) then
-                local p, kind = aimPoint(actor, vec(loc), cam)
-                candidates[#candidates + 1] = { actor = actor, point = p, kind = kind, key = addr(actor) }
+            elseif isAlive(actor) then
+                if S.aimSkipBurrowed and isBurrowed(actor) then
+                    -- Ducked mushroom: its body blocks all damage, but the hat on top can still be shot.
+                    local hat = hatPoints(actor)
+                    if hat then
+                        candidates[#candidates + 1] = { actor = actor, point = hat[1].point, kind = hat[1].kind,
+                            key = addr(actor), loc = vec(loc), alt = hat }
+                    end
+                else
+                    local p, kind = aimPoint(actor, vec(loc), cam)
+                    candidates[#candidates + 1] = { actor = actor, point = p, kind = kind, key = addr(actor), loc = vec(loc) }
+                end
             end
         end
     end
@@ -1580,13 +1882,28 @@ local function aimTick(pc)
         end
     end
 
+    -- Clays come first: they're only in the air for a moment, enemies stay. Any clay we know of, whatever
+    -- the direction (nearest the crosshair first, so the turn is shortest).
+    local clays = {}
+    for _, c in ipairs(candidates) do if c.kind == "supply" then clays[#clays + 1] = c end end
+    local clayFirst = nil
+    if #clays > 0 then clayFirst = Aim.pickTarget(cam, camR, clays, 180, maxDist, visible) end
+
     -- Keep the current target while it stays close, even if it ducks behind a shield for a moment.
     local best, angle = nil, nil
+    if lock.key and clayFirst and clayFirst.key ~= lock.key then
+        -- Locked onto an enemy (or a clay that's gone) while a clay is up: switch to the clay.
+        local onClay = false
+        for _, c in ipairs(clays) do if c.key == lock.key then onClay = true; break end end
+        if not onClay then lock.key, lock.lostAt = nil, nil end
+    end
     if lock.key then
         for _, c in ipairs(candidates) do
             if c.key == lock.key then
-                local a = Aim.angleTo(cam, camR, c.point, maxDist)
-                if Aim.keepLock(lock, c, a, visible(c), now(), S.aimFov, cfg.aim.stickyExtraFov, cfg.aim.stickySeconds) then
+                local clay = c.kind == "supply"
+                local a = Aim.angleTo(cam, camR, c.point, maxDist, clay)
+                local fov = clay and 180 or S.aimFov
+                if Aim.keepLock(lock, c, a, visible(c), now(), fov, cfg.aim.stickyExtraFov, cfg.aim.stickySeconds) then
                     best, angle = c, a
                 end
                 break
@@ -1595,21 +1912,30 @@ local function aimTick(pc)
         if not best then lock.key, lock.lostAt = nil, nil end
     end
     if not best then
-        best, angle = Aim.pickTarget(cam, camR, candidates, S.aimFov, maxDist, visible)
+        if clayFirst then
+            best, angle = clayFirst, Aim.angleTo(cam, camR, clayFirst.point, maxDist, true)
+        else
+            best, angle = Aim.pickTarget(cam, camR, candidates, S.aimFov, maxDist, visible)
+        end
         if best then lock.key, lock.lostAt = best.key, nil end
     end
     -- An enemy kept invulnerable by a lifeline guard: shoot the guard first, wherever it is.
-    if best and S.aimGuardsFirst and best.key and guardOf[best.key] then
+    if best and best.kind ~= "supply" and S.aimGuardsFirst and best.key and guardOf[best.key] then
         local g = guardOf[best.key]
         local gl = valid(g) and isAlive(g) and try(function() return g:K2_GetActorLocation() end)
         if isVec(gl) and near(gl, cam, maxDist) then
             local p = aimPoint(g, vec(gl), cam)
-            best = { actor = g, point = p, kind = "guard of " .. className(best.actor), key = addr(g) }
+            best = { actor = g, point = p, kind = "guard of " .. className(best.actor), key = addr(g), loc = vec(gl) }
             angle = Aim.angleTo(cam, camR, p) or angle
             lock.key, lock.lostAt = best.key, nil
         end
     end
     if not best then status.aimTarget = ""; return end
+    -- Enemies: make sure the shot is not stopped by terrain, walls or a shield on the way.
+    if S.aimLineOfSight and best.kind ~= "supply" and best.loc then
+        status.lineOfFire = ""
+        best.point, best.kind = lineOfFirePoint(pc, best.actor, best.loc, cam, best.point, best.kind, best.alt)
+    end
 
     -- One shot per clay: once a shot goes out while we're already on this clay, move to the next one.
     if best.kind == "supply" and best.key then
@@ -1766,6 +2092,8 @@ local function writeStatus()
             table.sort(list)
             return table.concat(list, ", ")
         end)(),
+        "lineOfFire=" .. (status.lineOfFire or ""),
+        "shieldsTracked=" .. #shields .. (shieldInfo ~= "" and (" (" .. shieldInfo .. ")") or ""),
         "minimapIcons=" .. (function()
             local shown = 0
             for _, p in ipairs(mm.pool) do if p.shown then shown = shown + 1 end end
@@ -1775,6 +2103,12 @@ local function writeStatus()
         "lastPing=" .. status.lastMarked,
         "lastError=" .. status.lastError:gsub("[\r\n]", " "),
     }
+    -- Only rewrite the file when something changed, plus once a second for the heartbeat (the window treats
+    -- the game as gone after 3 s of silence). Fewer rewrites = fewer chances for the window to read mid-swap.
+    local body = table.concat(lines, "\n", 2)
+    local t = os.time()
+    if body == status.writtenBody and t == status.writtenAt then return end
+    status.writtenBody, status.writtenAt = body, t
     writeFileAtomic(STATUS_PATH, table.concat(lines, "\n") .. "\n")
 end
 

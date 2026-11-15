@@ -285,6 +285,20 @@ local function makeWorld(opts)
             IsValid = function() return true end,
             IsStandalone = function() return W.role == "solo" end,
             IsServer = function() return W.role == "solo" or W.role == "host" end,
+            -- Line trace against W.blockers ({ box = oriented box, owner = actor }); W.traces counts calls.
+            LineTraceSingle = function(_, ctx, a, b, channel, complex, ignore, debug, hit)
+                W.traces = (W.traces or 0) + 1
+                for _, bl in ipairs(W.blockers or {}) do
+                    if Aim.segmentHitsBox(a, b, bl.box, 0) then
+                        hit.bBlockingHit = true
+                        hit.Location = { X = bl.box.center.X, Y = bl.box.center.Y, Z = bl.box.center.Z }
+                        hit.Component = { GetOwner = function() return bl.owner end }
+                        return true
+                    end
+                end
+                hit.bBlockingHit = false
+                return false
+            end,
         },
         ["/Script/EXGame.Default__EXTeamStatics"] = {
             IsValid = function() return true end,
@@ -799,11 +813,23 @@ local function gearWorld(settings, opts)
         W.shieldMesh = comp({ X = 960, Y = 0, Z = 40 }, { X = -4, Y = -45, Z = -60 }, { X = 4, Y = 45, Z = 60 })
         W.shield = W.obj("B_GoblinShield_C", { "EXDamageableParts" }, {
             _supers = { "B_DamageableParts_C", "EXASDamageableParts" }, _props = { "Shield_SM" }, Shield_SM = W.shieldMesh,
-            bIsBlock = true, bDestroy = false,
+            bIsBlock = true, bDestroy = true, -- like the game: set on intact shields ("destroy when broken")
             GetAttachParentActor = function() return W.goblin end,
             K2_GetActorLocation = function() return { X = 960, Y = 0, Z = 40 } end,
         })
         W.goblin.blocked = true -- the shield also blocks the line-of-sight trace
+        if opts.onlyViaGoblin then
+            -- In the real game FindAllOf missed the shield part; it is only reachable from the goblin itself.
+            for k in pairs({ B_GoblinShield_C = 1, EXDamageableParts = 1, B_DamageableParts_C = 1, EXASDamageableParts = 1 }) do
+                W.registry[k] = nil
+            end
+            if not opts.noComponent then
+                W.goblin.ShieldComponent = W.obj("ShieldComponent", {}, { bShieldBroken = opts.broken == true })
+            end
+            -- Like the game: the shield is in the ChildActor field; GetChildActor() can't be called from Lua.
+            W.goblin.B_GoblinShield = W.obj("ChildActorComponent", {}, { ChildActor = W.shield })
+            if opts.broken then W.goblin.blocked = false end
+        end
     end
     W.load(settings or ALL_ON)
     W.keysDown = { RightMouseButton = true }
@@ -836,6 +862,101 @@ test("aim/main: weak spot behind a shield -> aims over the shield instead", func
     -- the aim line must clear the shield's top edge (z = 100 at x = 960)
     local dx, dy, dz = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
     truthy(dz / dx * 956 > 100, "line passes above the shield")
+end)
+
+test("aim/main: a goblin's shield is found through the goblin when FindAllOf misses it", function()
+    local W = gearWorld(nil, { shield = true, onlyViaGoblin = true })
+    local st = W.status().aimTarget
+    truthy(st:find("over shield"), st)
+    local dx, dy, dz = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
+    truthy(dz / dx * 956 > 100 + 12, "line clears the shield's top edge with margin")
+end)
+
+test("aim/main: plain shield goblin (no ShieldComponent, only the B_GoblinShield child actor) is handled", function()
+    local W = gearWorld(nil, { shield = true, onlyViaGoblin = true, noComponent = true })
+    local st = W.status().aimTarget
+    truthy(st:find("over shield"), st)
+    truthy(W.status().shieldsTracked:find("^1 %(shield goblins 1, still holding a shield 1%)"), W.status().shieldsTracked)
+end)
+
+test("aim/main: a broken shield is ignored; the weak spot is targeted again", function()
+    local W = gearWorld(nil, { shield = true, onlyViaGoblin = true, broken = true })
+    assertAimedAt(W, { X = 1000, Y = 0, Z = 40 })
+end)
+
+test("status: the file is not rewritten when nothing changed within the same second", function()
+    local W = makeWorld()
+    W.load(ALL_ON)
+    W.tick(2)
+    -- Start right after a second boundary so both io ticks fall in the same second.
+    local t0 = os.time()
+    while os.time() == t0 do end
+    W.ioLoop()
+    local path = W.dir .. SEP .. "status.ini"
+    local f1 = io.open(path, "rb"); truthy(f1, "written"); f1:close()
+    os.remove(path)
+    W.ioLoop()
+    local f2 = io.open(path, "rb")
+    if f2 then f2:close() end
+    eq(f2, nil, "unchanged within the second: not rewritten")
+end)
+
+local function axisBox(center, half)
+    return { center = center, axes = { { X = 1, Y = 0, Z = 0 }, { X = 0, Y = 1, Z = 0 }, { X = 0, Y = 0, Z = 1 } },
+             min = { X = -half.X, Y = -half.Y, Z = -half.Z }, max = half }
+end
+
+test("line of fire: a rock in front of a low weak spot -> aims at a part the shot can reach", function()
+    local W = makeWorld()
+    -- Shroom bomber: the game puts its weak spot down by the legs.
+    W.enemy("B_C2_Goblin_Shroom_Bomber_C", { X = 1000, Y = 0, Z = 0 },
+        { weakSpot = { X = 1000, Y = 0, Z = -60 }, auto = { X = 1000, Y = 0, Z = 30 } })
+    local rock = W.obj("StaticMeshActor", { "Actor" }, {})
+    W.blockers = { { box = axisBox({ X = 900, Y = 0, Z = -70 }, { X = 30, Y = 80, Z = 25 }), owner = rock } }
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    local st = W.status()
+    truthy(st.aimTarget:find("clear shot"), st.aimTarget)
+    truthy(st.lineOfFire:find("weakspot blocked by StaticMeshActor", 1, true), st.lineOfFire)
+    local dx, dy, dz = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
+    truthy(dz / dx * 1000 > -20, "aims above the rock")
+end)
+
+test("line of fire: nothing in the way -> the weak spot is kept, even down low", function()
+    local W = makeWorld()
+    W.enemy("B_C2_Goblin_Shroom_Bomber_C", { X = 1000, Y = 0, Z = 0 },
+        { weakSpot = { X = 1000, Y = 0, Z = -60 }, auto = { X = 1000, Y = 0, Z = 30 } })
+    W.load(ALL_ON)
+    W.keysDown = { RightMouseButton = true }
+    W.tick(6)
+    truthy(W.status().aimTarget:find("weakspot"), W.status().aimTarget)
+    assertAimedAt(W, { X = 1000, Y = 0, Z = -60 })
+end)
+
+test("line of fire: a shield too tall to aim over -> a body part sticking out past it", function()
+    local W = gearWorld(nil, { shield = true, onlyViaGoblin = true, noComponent = true })
+    -- Make the shield 3 m tall: no point over it hits the goblin.
+    W.shieldMesh.loc = { X = 960, Y = 0, Z = 100 }
+    W.shield.K2_GetActorLocation = function() return { X = 960, Y = 0, Z = 100 } end
+    local bones = { { "spine_01", { X = 1000, Y = 0, Z = 40 } }, { "head", { X = 1000, Y = 0, Z = 80 } },
+                    { "hand_r", { X = 1000, Y = 65, Z = 30 } }, { "ik_hand_gun", { X = 1000, Y = 200, Z = 30 } } }
+    W.goblin.Mesh = { IsValid = function() return true end,
+        DoesSocketExist = function() return false end,
+        GetNumBones = function() return #bones end,
+        GetBoneName = function(_, i) local n = bones[i + 1][1]; return { ToString = function() return n end } end,
+        GetSocketLocation = function(_, n)
+            for _, b in ipairs(bones) do if b[1] == n.name then return b[2] end end
+        end }
+    -- shield box: local -4..4 / -45..45 / -150..150 around its mesh center
+    W.shieldMesh.GetLocalBounds = function(_, a, b)
+        a.X, a.Y, a.Z = -4, -45, -150
+        b.X, b.Y, b.Z = 4, 45, 150
+    end
+    W.tick(6)
+    local st = W.status()
+    truthy(st.aimTarget:find("body hand_r%+clear shot"), st.aimTarget .. " | " .. st.lineOfFire .. " | " .. st.shieldsTracked)
+    assertAimedAt(W, { X = 1000, Y = 65, Z = 30 })
 end)
 
 test("aim/main: shield handling can be turned off", function()
@@ -1048,6 +1169,57 @@ test("aim/main: ducked mushroom is skipped, targeted again when it pops up", fun
     assertAimedAt(W, { X = 1000, Y = 0, Z = 70 })
 end)
 
+local function giveHat(W)
+    -- Body bones plus the hat orbs on top (prefix ElphaHat), like B_C2_Spore_Colony_Elpha_C.
+    local bones = { { "pelvis", { X = 1000, Y = 0, Z = 0 } }, { "ElphaHat01", { X = 1000, Y = 0, Z = 60 } },
+                    { "ElphaHat02", { X = 1000, Y = 20, Z = 95 } }, { "ElphaHat03", { X = 1000, Y = -20, Z = 80 } } }
+    W.shroom.Mesh = { IsValid = function() return true end,
+        DoesSocketExist = function(_, n) return n.name == "head" end,
+        GetNumBones = function() return #bones end,
+        GetBoneName = function(_, i) local n = bones[i + 1][1]; return { ToString = function() return n end } end,
+        GetSocketLocation = function(_, n)
+            for _, b in ipairs(bones) do if b[1] == n.name then return b[2] end end
+            return { X = 1000, Y = 0, Z = 70 }
+        end }
+    W.colony.HatBonePrefix = { ToString = function() return "ElphaHat" end }
+    W.colony.bHatDestroyed = false
+end
+
+test("aim/main: ducked mushroom -> shoots the hat orbs on top (topmost first)", function()
+    local W = shroomWorld()
+    giveHat(W)
+    W.colony.bIsBurrowed = true
+    W.setRot = nil
+    W.tick(3)
+    truthy(W.status().aimTarget:find("hat ElphaHat02"), W.status().aimTarget)
+    assertAimedAt(W, { X = 1000, Y = 20, Z = 95 })
+end)
+
+test("aim/main: ducked mushroom with its hat broken is skipped", function()
+    local W = shroomWorld()
+    giveHat(W)
+    W.colony.bIsBurrowed = true
+    W.colony.bHatDestroyed = true
+    W.setRot = nil
+    W.tick(3)
+    assertAimedAt(W, { X = 1000, Y = 120, Z = 70 })
+end)
+
+test("aim/main: top hat orb behind cover -> another hat orb, not the body", function()
+    local W = shroomWorld()
+    giveHat(W)
+    W.colony.bIsBurrowed = true
+    -- A ledge hides the top orb (y = 20, z = 95) but not the one at y = -20.
+    local ledge = W.obj("StaticMeshActor", { "Actor" }, {})
+    W.blockers = { { box = { center = { X = 950, Y = 25, Z = 90 },
+        axes = { { X = 1, Y = 0, Z = 0 }, { X = 0, Y = 1, Z = 0 }, { X = 0, Y = 0, Z = 1 } },
+        min = { X = -10, Y = -15, Z = -15 }, max = { X = 10, Y = 15, Z = 15 } }, owner = ledge } }
+    W.setRot = nil
+    W.tick(3)
+    truthy(W.status().aimTarget:find("hat ElphaHat03"), W.status().aimTarget)
+    assertAimedAt(W, { X = 1000, Y = -20, Z = 80 })
+end)
+
 test("aim/main: skipping ducked mushrooms can be turned off", function()
     local W = shroomWorld(ALL_ON .. "aimSkipBurrowed=0\n")
     W.colony.bIsBurrowed = true
@@ -1165,6 +1337,58 @@ local function frame(W, shoot)
     W.sinceFire = shoot and 0.001 or (W.sinceFire + 0.02)
     W.tick()
 end
+
+test("clays: taken from any direction, outside the aim radius and behind you", function()
+    local W = clayWorld(true)
+    -- Replace the clays: one 45 deg to the side (aim radius is 10 deg) and one straight behind the camera.
+    local function clayAt(x, y)
+        return W.obj("B_ClayShooting_Stone_C", { "EXASClayShootingBase", "Actor" }, {
+            K2_GetActorLocation = function() return { X = x, Y = y, Z = 0 } end })
+    end
+    W.a.removed, W.b.removed = true, true
+    W.registry["EXASClayShootingBase"] = nil
+    W.registry["B_ClayShooting_Stone_C"] = nil
+    local side, behind = clayAt(1000, 1000), clayAt(-1000, 0)
+    W.tick(6)
+    local dx, dy = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
+    near(math.deg(math.atan(dy, dx)), 45, 0.5, "side clay first (shorter turn)")
+    frame(W, false); frame(W, true); frame(W, false)
+    dx, dy = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
+    truthy(dx < -0.99, "then the clay behind: " .. dx)
+end)
+
+test("clays: come before enemies, even one on the crosshair (clays are only up for a moment)", function()
+    local W = clayWorld(true)
+    W.a.removed, W.b.removed = true, true
+    W.registry["EXASClayShootingBase"] = nil
+    W.registry["B_ClayShooting_Stone_C"] = nil
+    W.obj("B_ClayShooting_Stone_C", { "EXASClayShootingBase", "Actor" }, {
+        K2_GetActorLocation = function() return { X = -1000, Y = 0, Z = 0 } end })
+    W.enemy("B_Goblin_C", { X = 1000, Y = 20, Z = 0 })
+    W.tick(6)
+    truthy(W.status().aimTarget:find("supply"), W.status().aimTarget)
+    local dx = Aim.rotToDir(W.setRot.Pitch, W.setRot.Yaw)
+    truthy(dx < -0.99, "turned to the clay behind")
+end)
+
+test("clays: a clay appearing mid-fight takes over from the locked enemy; back to enemies after", function()
+    local W = clayWorld(true)
+    W.a.removed, W.b.removed = true, true
+    W.registry["EXASClayShootingBase"] = nil
+    W.registry["B_ClayShooting_Stone_C"] = nil
+    W.enemy("B_Goblin_C", { X = 1000, Y = 20, Z = 0 })
+    W.tick(6)
+    truthy(W.status().aimTarget:find("B_Goblin_C"), W.status().aimTarget)
+    local clay = W.obj("B_ClayShooting_Stone_C", { "EXASClayShootingBase", "Actor" }, {
+        K2_GetActorLocation = function() return { X = 0, Y = 1000, Z = 0 } end })
+    W.tick(6)
+    truthy(W.status().aimTarget:find("supply"), "switched to the clay: " .. W.status().aimTarget)
+    W.registry["EXASClayShootingBase"] = nil
+    W.registry["B_ClayShooting_Stone_C"] = nil
+    clay.IsValid = function() return false end
+    W.tick(6)
+    truthy(W.status().aimTarget:find("B_Goblin_C"), "back on the enemy: " .. W.status().aimTarget)
+end)
 
 test("clays: moves to the next clay as soon as the game reports a shot", function()
     local W = clayWorld(true)
@@ -1360,6 +1584,95 @@ test("minimap: turning the option off hides the icons; the pool is not rebuilt",
     writeFile(W.dir .. SEP .. "settings.ini", "highlightChests=1\nminimapIcons=1\n")
     W.tick(8)
     eq(#drawn(W), 2); eq(#W.images, 24, "same pool")
+end)
+
+test("minimap: scale is measured from visible game icons only; hidden icons' stale positions are ignored", function()
+    local W = minimapWorld("highlightChests=1\nminimapIcons=1\n")
+    local function gameIcon(x, tx, visible)
+        local owner = W.obj("B_Enemy_C", { "Actor" }, { K2_GetActorLocation = function() return { X = x, Y = 0, Z = 0 } end })
+        W.obj("W_MinimapIcon_C", { "W_MinimapIcon_C" }, { IconOwner = owner, MinimapRef = W.minimap, MaxHalfSize = 184,
+            RenderTransform = { Translation = { X = tx, Y = 0 } }, IsVisible = function() return visible end })
+    end
+    gameIcon(2000, 140, true)    -- 0.07 px/cm: the real scale
+    gameIcon(3000, 42, false)    -- dead enemy: stale position, 0.014 px/cm (the bug)
+    gameIcon(2500, 25, false)
+    gameIcon(1500, 150, true)    -- 0.1 px/cm counts too
+    gameIcon(1000, 1, true)      -- too close to the center to measure
+    W.tick(8)
+    local s = W.status().minimapIcons
+    truthy(s:find("scale 0.0700") or s:find("scale 0.1000"), s)
+    truthy(not s:find("scale 0.01"), s)
+end)
+
+test("minimap: one badge per secret wall; parked (origin) and other-area objects get none", function()
+    local W = minimapWorld("highlightSecretWalls=1\nminimapIcons=1\n")
+    local function wall(x, y, z)
+        local mesh = W.obj("StaticMeshComponent", {}, { _primitive = true,
+            SetRenderCustomDepth = function() end, SetCustomDepthStencilValue = function() end })
+        return W.obj("B_SecretBreakableWall_C", { "B_SecretBreakableWall_C", "Actor" }, { _props = { "M" }, M = mesh,
+            K2_GetActorLocation = function() return { X = x, Y = y, Z = z } end })
+    end
+    W.registry["B_SecretBreakableWall_C"] = {
+        wall(2000, 0, 800), wall(2000, 172, 850),   -- one secret wall built from two pieces
+        wall(0, 0, 0), wall(0, 0, 0),               -- unused walls parked at the world origin
+        wall(-1500, 0, -110000),                    -- hidden dungeon sublevel far below
+        wall(-2000, 0, 0),                          -- another real wall
+    }
+    W.tick(8)
+    local d = drawn(W)
+    eq(#d, 2, "two real walls, one badge each")
+    near(d[1].x, 0.06 * 2000, 1e-6)
+    near(d[2].x, -0.06 * 2000, 1e-6)
+end)
+
+test("minimap: dynamic event graves are highlighted with loot chests and get their own badge", function()
+    local W = minimapWorld("highlightChests=1\nminimapIcons=1\n")
+    local mesh = W.obj("StaticMeshComponent", {}, { _primitive = true,
+        SetRenderCustomDepth = function() end, SetCustomDepthStencilValue = function() end })
+    local grave = W.obj("BP_DynamicEvent_Grave_C", { "BP_DynamicEvent_Grave_C", "Actor" }, {
+        _supers = { "EXASDynamicEventPoint", "EXLevelActor", "Actor" }, _props = { "M" }, M = mesh,
+        K2_GetActorLocation = function() return { X = 500, Y = 0, Z = 0 } end })
+    W.registry["BP_DynamicEvent_Grave_C"] = { grave }
+    W.tick(8)
+    local d = drawn(W)
+    truthy(d[1].tex:find("event_grave.png"), d[1].tex)
+    near(d[1].x, 30, 1e-6)
+    -- The event is won: its reward chest appears next to the grave, and the grave's badge goes away.
+    local rmesh = W.obj("StaticMeshComponent", {}, { _primitive = true,
+        SetRenderCustomDepth = function() end, SetCustomDepthStencilValue = function() end })
+    local reward = W.obj("B_SuddenEventReward_Level_01_C", { "B_SuddenEventReward_Level_01_C", "Actor" }, {
+        _supers = { "B_SuddenEventReward_C", "EXASSuddenEventReward", "Actor" }, _props = { "M" }, M = rmesh,
+        K2_GetActorLocation = function() return { X = 520, Y = 40, Z = 0 } end })
+    table.insert(W.registry["EXASSuddenEventReward"], reward)
+    W.tick(8)
+    for _, img in ipairs(drawn(W)) do
+        truthy(not img.tex:find("event_grave.png"), "grave badge removed after the event")
+    end
+    truthy(W.status().highlighted:find("B_SuddenEventReward_Level_01_C"), W.status().highlighted)
+    truthy(not W.status().highlighted:find("BP_DynamicEvent_Grave_C"), W.status().highlighted)
+end)
+
+test("highlights: a won grave (completed material) stays hidden even after its reward chest is gone", function()
+    local W = minimapWorld("highlightChests=1\nminimapIcons=1\n")
+    local done = W.obj("MaterialInstanceConstant", {}, {})
+    local pre = W.obj("MaterialInstanceConstant", {}, {})
+    local current = W.obj("MaterialInstanceDynamic", {}, { Parent = pre })
+    local vmesh = W.obj("StaticMeshComponent", {}, { _primitive = true,
+        SetRenderCustomDepth = function() end, SetCustomDepthStencilValue = function() end,
+        GetMaterial = function() return current end })
+    local grave = W.obj("BP_DynamicEvent_Grave_C", { "BP_DynamicEvent_Grave_C", "Actor" }, {
+        _supers = { "EXASDynamicEventPoint", "EXLevelActor", "Actor" }, _props = { "VisualMesh" }, VisualMesh = vmesh,
+        CompletedMaterial = done,
+        K2_GetActorLocation = function() return { X = 500, Y = 0, Z = 0 } end })
+    W.registry["BP_DynamicEvent_Grave_C"] = { grave }
+    W.tick(8)
+    truthy(W.status().highlighted:find("BP_DynamicEvent_Grave_C"), "not started yet: highlighted")
+    current = W.obj("MaterialInstanceDynamic", {}, { Parent = done })   -- event won
+    W.tick(8)
+    truthy(not W.status().highlighted:find("BP_DynamicEvent_Grave_C"), W.status().highlighted)
+    current = W.obj("MaterialInstanceDynamic", {}, { Parent = pre })    -- even if it looked unfinished again
+    W.tick(8)
+    truthy(not W.status().highlighted:find("BP_DynamicEvent_Grave_C"), "stays hidden")
 end)
 
 test("minimap: icons left by an earlier trainer version are removed", function()

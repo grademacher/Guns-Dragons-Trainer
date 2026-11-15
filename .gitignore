@@ -5,6 +5,7 @@ probe.txt
 enemies.txt
 pings.txt
 runtime_state.txt
+gui_errors.txt
 *.log
 *.dmp
 *.old

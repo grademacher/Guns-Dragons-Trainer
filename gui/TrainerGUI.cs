@@ -45,8 +45,11 @@ namespace GunsDragonsTrainer
             string text = null;
             for (int i = 0; i < 5 && text == null; i++)
             {
+                // The mod replaces its files by delete + rename: a read can land on a file Windows is still
+                // deleting, which throws UnauthorizedAccessException (not IOException).
                 try { if (File.Exists(Path)) text = File.ReadAllText(Path); else return; }
                 catch (IOException) { Thread.Sleep(20); }
+                catch (UnauthorizedAccessException) { Thread.Sleep(20); }
             }
             foreach (var kv in Parse(text)) Set(kv.Key, kv.Value);
         }
@@ -441,7 +444,7 @@ namespace GunsDragonsTrainer
             tOverShield = Toggle("Aim over shields");
             tLead = Toggle("Lead moving targets / bullet drop");
             tGuards = Toggle("Shoot protectors first (imps, shamans)");
-            tBurrow = Toggle("Ignore ducking mushrooms");
+            tBurrow = Toggle("Ducking mushrooms: shoot their hat");
             lTarget = new Label { ForeColor = Theme.Muted, AutoSize = false, Height = 18, Text = "" };
             Section("Aim assist (works as host or client)", new Control[] {
                 tAim, sFov, sSmooth, sDist, LabeledCombo("Mode", cMode), LabeledCombo("Hold key", cHoldKey), tWeak, tExplosive, tOverShield, tGuards, tBurrow, tLead, tLos, lTarget
@@ -587,8 +590,11 @@ namespace GunsDragonsTrainer
         void PollStatus()
         {
             Dictionary<string, string> st = null;
+            // status.ini is rewritten 4x a second by delete + rename; a read that lands mid-swap throws
+            // IOException or UnauthorizedAccessException ("access denied" on a file being deleted). Skip this tick.
             try { if (File.Exists(statusPath)) st = IniFile.Parse(File.ReadAllText(statusPath)); }
             catch (IOException) { return; }
+            catch (UnauthorizedAccessException) { return; }
 
             long hb = 0;
             string hbs;
@@ -681,6 +687,16 @@ namespace GunsDragonsTrainer
 
     static class Program
     {
+        static void LogError(Exception ex)
+        {
+            try
+            {
+                string path = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "gui_errors.txt");
+                File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + ex + Environment.NewLine + Environment.NewLine);
+            }
+            catch { }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
@@ -690,6 +706,10 @@ namespace GunsDragonsTrainer
             using (var mutex = new Mutex(true, mutexName, out created))
             {
                 if (!created) return;
+                // Never show .NET's "unhandled exception" dialog over the game: log it next to the exe and carry on.
+                Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                Application.ThreadException += (s, e) => LogError(e.Exception);
+                AppDomain.CurrentDomain.UnhandledException += (s, e) => LogError(e.ExceptionObject as Exception);
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
                 string dir = Path.GetDirectoryName(Application.ExecutablePath);

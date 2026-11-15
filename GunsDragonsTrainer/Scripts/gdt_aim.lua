@@ -55,21 +55,22 @@ function M.pickTarget(cam, camRot, candidates, fovDeg, maxDist, visible)
     table.sort(hits, function(a, b) return a.dot > b.dot end)
     for _, h in ipairs(hits) do
         if visible == nil or visible(h.c) then
-            return h.c, math.deg(math.acos(math.min(1, h.dot)))
+            return h.c, math.deg(math.acos(math.max(-1, math.min(1, h.dot))))
         end
     end
     return nil
 end
 
 -- Angle in degrees between the crosshair and `point`, or nil if behind the camera / out of range.
-function M.angleTo(cam, camRot, point, maxDist)
+-- With anyDirection, points behind the camera give their angle (up to 180) instead of nil.
+function M.angleTo(cam, camRot, point, maxDist, anyDirection)
     local fx, fy, fz = M.rotToDir(camRot.Pitch, camRot.Yaw)
     local dx, dy, dz = point.X - cam.X, point.Y - cam.Y, point.Z - cam.Z
     local d2 = dx * dx + dy * dy + dz * dz
     if d2 <= 1 or (maxDist and d2 > maxDist * maxDist) then return nil end
     local dot = (dx * fx + dy * fy + dz * fz) / math.sqrt(d2)
-    if dot <= 0 then return nil end
-    return math.deg(math.acos(math.min(1, dot)))
+    if dot <= 0 and not anyDirection then return nil end
+    return math.deg(math.acos(math.max(-1, math.min(1, dot))))
 end
 
 -- Sticky target lock: keeps the current target while it stays near the crosshair, even if it is briefly

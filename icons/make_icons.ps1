@@ -89,3 +89,14 @@ foreach ($row in @(@(18, 0), @(27, 6), @(36, 0))) {
 $crack = New-Object System.Drawing.Pen (C 20 22 28), 3
 $b.G.DrawLines($crack, @((New-Object System.Drawing.PointF 36, 15), (New-Object System.Drawing.PointF 30, 25), (New-Object System.Drawing.PointF 36, 33), (New-Object System.Drawing.PointF 29, 46)))
 Save-Badge $b "secret_wall.png"
+
+# Dynamic event (grave): teal, tombstone with a cross
+$b = New-Badge (C 60 190 200)
+$stone = New-Object System.Drawing.SolidBrush (C 110 220 228)
+$b.G.FillPie($stone, 21, 14, 22, 20, 180, 180)    # rounded top
+$b.G.FillRectangle($stone, 21, 23, 22, 21)         # body
+$b.G.FillRectangle($stone, 17, 43, 30, 5)          # base
+$dark = New-Object System.Drawing.SolidBrush (C 26 31 40)
+$b.G.FillRectangle($dark, 30, 20, 4, 16)           # cross
+$b.G.FillRectangle($dark, 25, 25, 14, 4)
+Save-Badge $b "event_grave.png"
